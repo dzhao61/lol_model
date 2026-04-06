@@ -269,6 +269,24 @@ def fetch_market_volume(condition_id: str):
     return get_market_volume(condition_id)
 
 
+@st.cache_data(ttl=300, show_spinner=False)
+def fetch_market_rewards(condition_id: str):
+    """Return reward config dict for a market, or None if no rewards."""
+    try:
+        import requests
+        from scripts.polymarket_client import get_client
+        host = get_client().host
+        resp = requests.get(f"{host}/rewards/markets/{condition_id}", timeout=8)
+        if not resp.ok:
+            return None
+        data = resp.json()
+        items = data if isinstance(data, list) else data.get("data", [])
+        return items[0] if items else None
+    except Exception:
+        return None
+
+
+
 @st.cache_data(show_spinner=False)
 def run_models(team1: str, team2: str, context_key: str, context: dict):
     """context_key is a hashable string for cache keying."""
@@ -306,14 +324,15 @@ st.markdown("<div style='border-top:1px solid #2d3748;margin:4px 0 8px'></div>",
 ctrl_league, ctrl_match, ctrl_refresh = st.columns([1, 6, 1], gap="small")
 
 with ctrl_league:
+    _LEAGUES = ["LCK", "LCKC", "LPL", "LEC", "LCS", "All"]
     league_sel = st.selectbox(
-        "League", ["LCK", "LPL", "LEC", "LCS", "All"],
-        index=["LCK", "LPL", "LEC", "LCS", "All"].index(
-            st.session_state.get("league_sel", "LCK")
-        ),
+        "League", _LEAGUES,
+        index=_LEAGUES.index(st.session_state.get("league_sel", "LCK")),
         key="league_sel",
     )
-    league_filter = "" if league_sel == "All" else league_sel
+    # Map display codes → Polymarket search strings
+    _LEAGUE_QUERY = {"LCKC": "lck challenger"}
+    league_filter = "" if league_sel == "All" else _LEAGUE_QUERY.get(league_sel, league_sel)
 
 markets, market_err = load_markets(league=league_filter)
 
@@ -617,6 +636,16 @@ with left_col:
         half_spread = st.number_input("Half-spread (¢)", 1, value=2, step=1) / 100
     with s2:
         quote_size  = st.number_input("Shares / side", 5, value=30, step=5)
+    quote_mode = st.radio(
+        "Quote mode",
+        ["Rewards", "Directional"],
+        horizontal=True,
+        key="quote_mode",
+        help=(
+            "Rewards: center quotes on market mid to maximise liquidity reward score. "
+            "Directional: center on blended fair value to express your model view."
+        ),
+    )
 
     # Team name overrides (collapsed)
     # Keys are scoped to condition_id so stale widget state never bleeds across markets.
@@ -746,11 +775,12 @@ with right_col:
         # Ensemble row (inverse-log-loss weighted)
         if p_series_list:
             from pipeline.models import ensemble_predict
-            # Build model_probs dict for ensemble
-            _ens_probs = {}
+            _ens_probs      = {}
+            _ens_game_probs = {}
             for rd in rows_data:
                 if "error" not in rd:
-                    _ens_probs[rd["label"]] = rd["p1"]
+                    _ens_probs[rd["label"]]      = rd["p1"]                          # series prob
+                    _ens_game_probs[rd["label"]] = model_results[rd["label"]]["p_model"]  # per-game
             _label_weights = None
             if _ENSEMBLE_WEIGHTS_RAW:
                 _label_weights = {
@@ -758,8 +788,11 @@ with right_col:
                     for lbl in _ens_probs
                     if _LABEL_TO_KEY.get(lbl) in _ENSEMBLE_WEIGHTS_RAW
                 }
-            p_avg, _model_std = ensemble_predict(_ens_probs, weights=_label_weights)
-            st.session_state["_model_std"] = _model_std
+            p_avg,      _model_std = ensemble_predict(_ens_probs,      weights=_label_weights)
+            p_avg_game, _          = ensemble_predict(_ens_game_probs, weights=_label_weights)
+            st.session_state["_model_std"]        = _model_std
+            st.session_state["_p_ensemble"]       = p_avg
+            st.session_state["_p_ensemble_game"]  = p_avg_game
             avg_ey    = p_avg - p_market_yes
             avg_en    = (1.0 - p_avg) - (1.0 - p_market_yes)
             ey_cls    = _edge_class(avg_ey)
@@ -800,17 +833,22 @@ with right_col:
 
         qb1, qb2, qb3 = st.columns([2, 1, 1])
         with qb1:
-            valid_models = [lbl for lbl, r in model_results.items() if "error" not in r]
+            valid_models = ["Ensemble"] + [lbl for lbl, r in model_results.items() if "error" not in r]
             model_choice = st.selectbox("Model", valid_models, key="model_choice")
         with qb2:
             prob_choice = st.radio("Prob", ["Series", "Per-game"], horizontal=True, key="prob_choice")
         with qb3:
             kelly_frac = st.number_input("Kelly frac", 0.05, 1.0, 0.25, 0.05, key="kelly_frac")
 
-        r_chosen = model_results[model_choice]
-        p_game   = r_chosen["p_model"]
-        p_ser    = series_win_prob(p_game, series_fmt) if series_fmt in ("Bo3", "Bo5") else p_game
-        p_model_raw = p_ser if prob_choice == "Series" else p_game
+        if model_choice == "Ensemble":
+            _p_ens_ser  = st.session_state.get("_p_ensemble",      0.5)
+            _p_ens_game = st.session_state.get("_p_ensemble_game", 0.5)
+            p_model_raw = _p_ens_ser if prob_choice == "Series" else _p_ens_game
+        else:
+            r_chosen    = model_results[model_choice]
+            p_game      = r_chosen["p_model"]
+            p_ser       = series_win_prob(p_game, series_fmt) if series_fmt in ("Bo3", "Bo5") else p_game
+            p_model_raw = p_ser if prob_choice == "Series" else p_game
 
         TICK     = 0.01
         fee      = taker_fee_per_share(p_market_yes)
@@ -829,9 +867,10 @@ with right_col:
             p_model_raw, p_market_yes, model_std=_mstd, hours_to_match=_hours_to_match,
         )
 
-        # Quotes centered on blended fair value
-        q_bid_raw = max(0.01, round(math.floor((p_fair - half_spread) / TICK) * TICK, 4))
-        q_ask_raw = min(0.99, round(math.ceil( (p_fair + half_spread) / TICK) * TICK, 4))
+        # Quotes centered on market mid (Rewards) or blended fair value (Directional)
+        _center   = (p_market_yes or 0.5) if quote_mode == "Rewards" else p_fair
+        q_bid_raw = max(0.01, round(math.floor((_center - half_spread) / TICK) * TICK, 4))
+        q_ask_raw = min(0.99, round(math.ceil( (_center + half_spread) / TICK) * TICK, 4))
 
         # Clamp to never cross the current market — ensures orders REST as makers.
         # Rule: our BUY price must be strictly below the current best ASK.
@@ -877,6 +916,35 @@ with right_col:
         t2_clamped = yes_bid is not None and no_price_raw > round(1.0 - yes_bid - TICK, 2)
 
         # ── Section 1: Market Making ──────────────────────────────────────────
+
+        # ── Rewards availability banner ───────────────────────────────────────
+        _rwds = fetch_market_rewards(sel_market.condition_id)
+        if _rwds:
+            _max_spread   = _rwds.get("rewards_max_spread", "?")
+            _min_size     = _rwds.get("rewards_min_size", "?")
+            _daily_rate   = _rwds.get("native_daily_rate") or _rwds.get("total_daily_rate", 0)
+            _configs      = _rwds.get("rewards_config", [])
+            _remaining    = sum(float(c.get("remaining_reward_amount", 0)) for c in _configs)
+            _total_pool   = sum(float(c.get("total_rewards", 0))           for c in _configs)
+            st.markdown(
+                f'<div style="background:#1a2e1a;border:1px solid #276749;border-radius:6px;'
+                f'padding:8px 14px;margin-bottom:8px;display:flex;gap:24px;flex-wrap:wrap;align-items:center">'
+                f'<span style="color:#68d391;font-weight:600;font-size:13px">💰 Rewards active</span>'
+                f'<span style="font-size:12px;color:#a0aec0">Max spread: <b style="color:#e2e8f0">{_max_spread}¢</b></span>'
+                f'<span style="font-size:12px;color:#a0aec0">Min size: <b style="color:#e2e8f0">{_min_size} shares</b></span>'
+                f'<span style="font-size:12px;color:#a0aec0">Daily pool: <b style="color:#e2e8f0">${float(_daily_rate):,.0f}</b></span>'
+                f'<span style="font-size:12px;color:#a0aec0">Remaining: <b style="color:#68d391">${_remaining:,.0f}</b> / ${_total_pool:,.0f}</span>'
+                f'</div>',
+                unsafe_allow_html=True,
+            )
+        else:
+            st.markdown(
+                f'<div style="background:#2d1f1f;border:1px solid #744210;border-radius:6px;'
+                f'padding:8px 14px;margin-bottom:8px">'
+                f'<span style="color:#fc8181;font-size:13px">⚠ No liquidity rewards for this market — '
+                f'maker rebate only</span></div>',
+                unsafe_allow_html=True,
+            )
 
         clamp_note = ""
         if t1_clamped or t2_clamped:
@@ -956,6 +1024,98 @@ with right_col:
             unsafe_allow_html=True,
         )
 
+        # ── Scenario analysis ─────────────────────────────────────────────────
+        from pipeline.betting import (
+            order_reward_score, estimate_liquidity_reward, DEFAULT_MAX_REWARD_SPREAD,
+        )
+
+        _mid = p_market_yes or 0.5
+        _no_mid = 1.0 - _mid
+
+        # Spread of each order from the market mid (what the reward formula uses)
+        _bid_spread_from_mid = abs(_mid       - t1_token_price)
+        _ask_spread_from_mid = abs(_no_mid - t2_token_price)
+
+        _q_yes = order_reward_score(_bid_spread_from_mid, n, DEFAULT_MAX_REWARD_SPREAD)
+        _q_no  = order_reward_score(_ask_spread_from_mid, n, DEFAULT_MAX_REWARD_SPREAD)
+        _est_reward = estimate_liquidity_reward(
+            _bid_spread_from_mid, n, _ask_spread_from_mid, n,
+        )
+
+        # Scenario EVs
+        _ev_t1_only = p_model_raw * t1_win - (1 - p_model_raw) * t1_loss
+        _ev_t2_only = (1 - p_model_raw) * t2_win - p_model_raw * t2_loss
+
+        def _fmt_dollar(v: float) -> str:
+            color = "#48bb78" if v >= 0 else "#fc8181"
+            sign  = "+" if v >= 0 else ""
+            return f'<span style="color:{color}">{sign}${v:.2f}</span>'
+
+        _q_color = lambda q: "#48bb78" if q > 0 else "#fc8181"
+
+        st.markdown(
+            f'<div style="margin:12px 0;padding:10px 14px;background:#1a202c;border-radius:6px;">'
+            f'<div style="font-size:11px;font-weight:600;color:#a0aec0;text-transform:uppercase;'
+            f'letter-spacing:.06em;margin-bottom:10px">Scenario Analysis</div>'
+
+            # Reward scores row
+            f'<div style="display:flex;gap:20px;margin-bottom:10px;flex-wrap:wrap">'
+            f'<div><span style="color:#718096;font-size:11px">Q-score YES</span> '
+            f'<b style="font-size:12px;color:{_q_color(_q_yes)}">{_q_yes:.1f}</b>'
+            f'<span style="color:#4a5568;font-size:10px"> ({_bid_spread_from_mid*100:.1f}¢ from mid)</span></div>'
+            f'<div><span style="color:#718096;font-size:11px">Q-score NO</span> '
+            f'<b style="font-size:12px;color:{_q_color(_q_no)}">{_q_no:.1f}</b>'
+            f'<span style="color:#4a5568;font-size:10px"> ({_ask_spread_from_mid*100:.1f}¢ from mid)</span></div>'
+            f'<div><span style="color:#718096;font-size:11px">Est. reward (10% share)</span> '
+            f'<b style="font-size:12px;color:#68d391">+${_est_reward:.2f}</b></div>'
+            + (
+                f'<div style="color:#f6ad55;font-size:11px">⚠ Directional mode — quotes centered on fair value ({p_fair*100:.0f}¢), '
+                f'not market mid ({_mid*100:.0f}¢). Reward score may be reduced or zero.</div>'
+                if quote_mode == "Directional" else ""
+            ) +
+            f'</div>'
+
+            # Scenario table
+            f'<table style="width:100%;border-collapse:collapse;font-size:11px">'
+            f'<thead><tr>'
+            f'<th style="text-align:left;color:#718096;padding:3px 6px;border-bottom:1px solid #2d3748">Scenario</th>'
+            f'<th style="text-align:right;color:#718096;padding:3px 6px;border-bottom:1px solid #2d3748">Best case</th>'
+            f'<th style="text-align:right;color:#718096;padding:3px 6px;border-bottom:1px solid #2d3748">Model EV</th>'
+            f'<th style="text-align:right;color:#718096;padding:3px 6px;border-bottom:1px solid #2d3748">Worst case</th>'
+            f'</tr></thead>'
+            f'<tbody>'
+            f'<tr>'
+            f'<td style="padding:3px 6px;color:#e2e8f0">Both fill (maker)</td>'
+            f'<td style="text-align:right;padding:3px 6px">{_fmt_dollar(both_profit)}</td>'
+            f'<td style="text-align:right;padding:3px 6px">{_fmt_dollar(both_profit)}</td>'
+            f'<td style="text-align:right;padding:3px 6px">{_fmt_dollar(both_profit)}</td>'
+            f'</tr>'
+            f'<tr>'
+            f'<td style="padding:3px 6px;color:#e2e8f0">Only {poly_t1} fills</td>'
+            f'<td style="text-align:right;padding:3px 6px">{_fmt_dollar(t1_win)}</td>'
+            f'<td style="text-align:right;padding:3px 6px">{_fmt_dollar(_ev_t1_only)}</td>'
+            f'<td style="text-align:right;padding:3px 6px">{_fmt_dollar(-t1_loss)}</td>'
+            f'</tr>'
+            f'<tr>'
+            f'<td style="padding:3px 6px;color:#e2e8f0">Only {poly_t2} fills</td>'
+            f'<td style="text-align:right;padding:3px 6px">{_fmt_dollar(t2_win)}</td>'
+            f'<td style="text-align:right;padding:3px 6px">{_fmt_dollar(_ev_t2_only)}</td>'
+            f'<td style="text-align:right;padding:3px 6px">{_fmt_dollar(-t2_loss)}</td>'
+            f'</tr>'
+            f'<tr>'
+            f'<td style="padding:3px 6px;color:#718096">Neither fills</td>'
+            f'<td style="text-align:right;padding:3px 6px"><span style="color:#718096">$0.00</span></td>'
+            f'<td style="text-align:right;padding:3px 6px"><span style="color:#718096">$0.00</span></td>'
+            f'<td style="text-align:right;padding:3px 6px"><span style="color:#718096">$0.00</span></td>'
+            f'</tr>'
+            f'</tbody></table>'
+            f'<div style="color:#718096;font-size:10px;margin-top:6px">'
+            f'Model EV for single-side fills uses p_model={p_model_raw*100:.0f}¢  ·  '
+            f'Best/worst = if winning / losing token fills.</div>'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
+
         mm1, mm2 = st.columns([3, 1])
         with mm1:
             if st.button(
@@ -985,6 +1145,11 @@ with right_col:
                             f"Orders placed  ·  {poly_t1} `{bid_str}…`"
                             f"  ·  {poly_t2} `{ask_str}…`"
                         )
+                        st.code(
+                            f"{poly_t1} (YES):  {posted.bid_order_id or 'unknown'}\n"
+                            f"{poly_t2} (NO):   {posted.ask_order_id or 'unknown'}",
+                            language=None,
+                        )
                     except Exception as e:
                         st.error(f"Post failed: {e}")
         with mm2:
@@ -1007,8 +1172,12 @@ with right_col:
                 f'Active  ·  {poly_t1} @ <b>{lo["t1_price"]*100:.0f}¢</b>'
                 f'  ·  {poly_t2} @ <b>{lo["t2_price"]*100:.0f}¢</b>'
                 f'  ·  <span style="color:#f6ad55">{age_s}s ago</span>'
-                f'  ·  <code>{lo["bid_id"][:10]}…</code> / <code>{lo["ask_id"][:10]}…</code>'
                 f'</div>',
                 unsafe_allow_html=True,
+            )
+            st.code(
+                f'YES: {lo["bid_id"] or "unknown"}\n'
+                f'NO:  {lo["ask_id"] or "unknown"}',
+                language=None,
             )
 

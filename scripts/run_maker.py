@@ -38,7 +38,8 @@ from scripts.predict_match  import predict_match, load_bundle, load_feat_df, ser
 from scripts.polymarket_client import (
     get_client, find_lol_markets, get_market_by_condition_id,
     get_mid_price, print_market_summary, post_two_sided_quote,
-    cancel_all_orders, get_open_orders,
+    cancel_all_orders, get_open_orders, check_order_scoring,
+    check_reward_percentages, check_reward_earnings, check_market_rewards,
 )
 from pipeline.betting import (
     market_maker_quotes, QuoteParams, fee_table, taker_fee_per_share,
@@ -169,7 +170,49 @@ def run(args):
             print()
         return
 
-    # ── 2. Cancel mode ────────────────────────────────────────────────────────
+    # ── 2. Check scoring mode ─────────────────────────────────────────────────
+    if args.check_scoring:
+        if not args.order_ids:
+            print("ERROR: --order-ids required for --check-scoring  (e.g. --order-ids 0xABC 0xDEF)")
+            sys.exit(1)
+        check_order_scoring(args.order_ids)
+        return
+
+    # ── 2b. Check earnings mode ───────────────────────────────────────────────
+    if args.check_earnings:
+        check_reward_percentages(args.condition_id)
+        check_reward_earnings(args.date or None)
+        return
+
+    # ── 2c. Market rewards mode ───────────────────────────────────────────────
+    if args.market_rewards:
+        if not args.condition_id:
+            print("ERROR: --condition-id required for --market-rewards")
+            sys.exit(1)
+        check_market_rewards(args.condition_id)
+        return
+
+    # ── 2b. Open orders mode ──────────────────────────────────────────────────
+    if args.open_orders:
+        if not args.condition_id:
+            print("ERROR: --condition-id required for --open-orders")
+            sys.exit(1)
+        orders = get_open_orders(args.condition_id)
+        if not orders:
+            print("No open orders found for this market.")
+            return
+        print(f"\nOpen orders ({len(orders)}):\n")
+        for o in orders:
+            oid  = o.get("id") or o.get("orderID") or "?"
+            side = o.get("side", "?")
+            price = o.get("price", "?")
+            size  = o.get("size") or o.get("originalSize", "?")
+            asset = o.get("asset_id", o.get("tokenId", ""))[:12]
+            print(f"  {oid}  side={side}  price={price}  size={size}  token={asset}...")
+        print()
+        return
+
+    # ── 3. Cancel mode ────────────────────────────────────────────────────────
     if args.cancel:
         if not args.condition_id:
             print("ERROR: --condition-id required for --cancel")
@@ -178,7 +221,7 @@ def run(args):
         cancel_all_orders(args.condition_id)
         return
 
-    # ── 3. Predict + quote mode ───────────────────────────────────────────────
+    # ── 4. Predict + quote mode ───────────────────────────────────────────────
     if not args.team1 or not args.team2:
         print("ERROR: --team1 and --team2 are required")
         sys.exit(1)
@@ -431,6 +474,18 @@ def main():
                         help="List active LoL markets")
     parser.add_argument("--query",        default=None,
                         help="Filter for --list-markets (e.g. 'T1')")
+    parser.add_argument("--open-orders",   action="store_true",
+                        help="List open orders for --condition-id with full order IDs")
+    parser.add_argument("--check-scoring",  action="store_true",
+                        help="Check whether orders are earning liquidity rewards")
+    parser.add_argument("--order-ids",      nargs="+", default=[],
+                        help="Order IDs to check with --check-scoring (e.g. 0xABC 0xDEF)")
+    parser.add_argument("--check-earnings", action="store_true",
+                        help="Show real-time reward % share and daily earnings")
+    parser.add_argument("--date",           default=None,
+                        help="Date for --check-earnings (YYYY-MM-DD, defaults to today)")
+    parser.add_argument("--market-rewards", action="store_true",
+                        help="Show reward config (pool size, max spread) for --condition-id")
     parser.add_argument("--show-fees",    action="store_true",
                         help="Print the fee/rebate table")
     parser.add_argument("--monitor",      action="store_true",

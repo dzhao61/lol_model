@@ -13,7 +13,6 @@ import json
 import os
 import re
 import sys
-import time
 import requests
 from pathlib import Path
 from dataclasses import dataclass
@@ -25,8 +24,10 @@ from dotenv import load_dotenv
 load_dotenv(ROOT / ".env")
 
 from py_clob_client.client import ClobClient
-from py_clob_client.clob_types import OrderArgs, PartialCreateOrderOptions
+from py_clob_client.clob_types import OrderArgs, PartialCreateOrderOptions, RequestArgs
 from py_clob_client.order_builder.constants import BUY, SELL
+from py_clob_client.headers.headers import create_level_2_headers
+from py_clob_client.http_helpers.helpers import get as _clob_get
 
 
 def _order_options(condition_id: str) -> PartialCreateOrderOptions:
@@ -538,21 +539,17 @@ def post_two_sided_quote(
         print(f"[DRY RUN] Would BUY team1 (YES) {size:.0f} shares @ {t1_price:.3f}")
         print(f"[DRY RUN] Would BUY team2 (NO)  {size:.0f} shares @ {t2_price:.3f}")
     else:
-        # Buy team1 token (YES)
-        bid_order = client.create_and_post_order(
+        bid_resp = client.create_and_post_order(
             OrderArgs(token_id=token_id, side=BUY, price=t1_price, size=size),
             opts,
         )
-        bid_id = bid_order.get("orderID") if bid_order else None
-
-        time.sleep(0.3)
-
-        # Buy team2 token (NO)
-        ask_order = client.create_and_post_order(
+        ask_resp = client.create_and_post_order(
             OrderArgs(token_id=no_token_id, side=BUY, price=t2_price, size=size),
             opts,
         )
-        ask_id = ask_order.get("orderID") if ask_order else None
+
+        bid_id = bid_resp.get("orderID") if isinstance(bid_resp, dict) else None
+        ask_id = ask_resp.get("orderID") if isinstance(ask_resp, dict) else None
 
         print(f"Posted BUY team1 (YES) {size:.0f} @ {t1_price:.3f}  [id: {str(bid_id)[:8]}...]")
         print(f"Posted BUY team2 (NO)  {size:.0f} @ {t2_price:.3f}  [id: {str(ask_id)[:8]}...]")
@@ -641,3 +638,172 @@ def print_market_summary(market: LoLMarket, p_model: float | None = None) -> Non
         edge = p_model - (snap["mid"] or 0.5)
         print(f"Edge vs mid: {edge:+.3f}")
     print(f"{'─'*60}\n")
+
+
+def check_order_scoring(order_ids: list[str]) -> None:
+    """
+    Print whether each order is currently scoring for liquidity rewards.
+
+    An order scores when it rests within 3¢ of the market mid.  Both
+    sides must score simultaneously for Q_min > 0 (full two-sided reward).
+    """
+    from py_clob_client.clob_types import OrdersScoringParams
+    client = get_client()
+
+    ids = [oid for oid in order_ids if oid]
+    if not ids:
+        print("No order IDs provided.")
+        return
+
+    result = client.are_orders_scoring(OrdersScoringParams(orderIds=ids))
+
+    print(f"\n{'─'*50}")
+    print(f"  Reward scoring check ({len(ids)} orders)")
+    print(f"{'─'*50}")
+
+    # Response is {orderID: bool}
+    if not isinstance(result, dict):
+        print(f"  Unexpected response format: {result}")
+        return
+
+    scoring_map: dict[str, bool] = result
+
+    both_scoring = True
+    for oid in ids:
+        scoring = scoring_map.get(oid, False)
+        icon = "✓" if scoring else "✗"
+        label = "SCORING" if scoring else "NOT SCORING (outside 3¢ window)"
+        print(f"  {icon}  {oid[:16]}...  {label}")
+        if not scoring:
+            both_scoring = False
+
+    if len(ids) >= 2:
+        print()
+        if both_scoring:
+            print("  Both orders scoring → two-sided Q_min > 0 → earning rewards ✓")
+        else:
+            print("  ⚠ One or both orders not scoring → Q_min = 0 → no rewards this period")
+    print(f"{'─'*50}\n")
+
+
+def _authed_get(path: str, params: dict | None = None) -> dict | list:
+    """Make an authenticated L2 GET request to the CLOB API."""
+    client = get_client()
+    sig_type = int(os.environ.get("POLY_SIGNATURE_TYPE", "1"))
+    query = f"?signature_type={sig_type}"
+    if params:
+        for k, v in params.items():
+            query += f"&{k}={v}"
+    full_path = path + query
+    req = RequestArgs(method="GET", request_path=full_path)
+    headers = create_level_2_headers(client.signer, client.creds, req)
+    return _clob_get(f"{client.host}{full_path}", headers=headers)
+
+
+def check_reward_percentages(condition_id: str | None = None) -> None:
+    """
+    Show your real-time liquidity reward % share per market.
+    A non-zero % means your orders are currently scoring and earning rewards.
+    """
+    result = _authed_get("/rewards/user/percentages")
+
+    print(f"\n{'─'*55}")
+    print(f"  Real-time reward market share")
+    print(f"{'─'*55}")
+
+    if not isinstance(result, dict) or not result:
+        print(f"  No active reward positions found.")
+        print(f"  (This means 0% share — orders may not be scoring)")
+        print(f"{'─'*55}\n")
+        return
+
+    for cid, pct in result.items():
+        marker = " ← THIS MARKET" if condition_id and cid == condition_id else ""
+        print(f"  {cid[:20]}...  {pct:.2f}%{marker}")
+
+    if condition_id and condition_id not in result:
+        print(f"\n  {condition_id[:20]}...  0.00%  ← THIS MARKET (not scoring)")
+
+    print(f"{'─'*55}\n")
+
+
+def check_reward_earnings(date: str | None = None) -> None:
+    """
+    Show actual USDC earnings from liquidity rewards for a given date (YYYY-MM-DD).
+    Defaults to today.
+    """
+    from datetime import date as _date
+    if date is None:
+        date = _date.today().isoformat()
+
+    result = _authed_get("/rewards/user", params={"date": date})
+
+    print(f"\n{'─'*55}")
+    print(f"  Reward earnings for {date}")
+    print(f"{'─'*55}")
+
+    rows = result if isinstance(result, list) else result.get("data", []) if isinstance(result, dict) else []
+
+    if not rows:
+        print(f"  No earnings recorded for {date}.")
+        print(f"  (Rewards are updated once daily — check again tomorrow for today's earnings)")
+        print(f"{'─'*55}\n")
+        return
+
+    total = 0.0
+    for r in rows:
+        cid      = r.get("condition_id", "?")[:20]
+        earnings = float(r.get("earnings", 0))
+        total   += earnings
+        print(f"  {cid}...  ${earnings:.4f}")
+
+    print(f"  {'─'*40}")
+    print(f"  Total:  ${total:.4f}")
+    print(f"{'─'*55}\n")
+
+
+def check_market_rewards(condition_id: str) -> None:
+    """
+    Show the reward configuration for a specific market.
+    Uses the public /rewards/markets/{condition_id} endpoint (no auth needed).
+    """
+    import requests
+    client = get_client()
+    url = f"{client.host}/rewards/markets/{condition_id}"
+    resp = requests.get(url, timeout=10)
+    data = resp.json() if resp.ok else {}
+
+    # Response may be a list or dict with a 'data' key
+    items = data if isinstance(data, list) else data.get("data", []) if isinstance(data, dict) else []
+
+    print(f"\n{'─'*55}")
+    print(f"  Reward config for market")
+    print(f"  {condition_id[:40]}...")
+    print(f"{'─'*55}")
+
+    if not items:
+        print(f"  ✗  NO liquidity rewards for this market")
+        print(f"{'─'*55}\n")
+        return
+
+    item = items[0] if isinstance(items, list) else items
+    max_spread   = item.get("rewards_max_spread", "?")
+    min_size     = item.get("rewards_min_size", "?")
+    daily_rate   = item.get("native_daily_rate") or item.get("total_daily_rate", "?")
+    competitive  = item.get("market_competitiveness", "?")
+
+    configs = item.get("rewards_config", [])
+    total_pool = sum(float(c.get("total_rewards", 0)) for c in configs) if configs else None
+    remaining  = sum(float(c.get("remaining_reward_amount", 0)) for c in configs) if configs else None
+
+    print(f"  ✓  Rewards ACTIVE")
+    print(f"     Max spread:      {max_spread}¢")
+    print(f"     Min size:        {min_size} shares")
+    print(f"     Daily rate:      ${daily_rate}")
+    if total_pool is not None:
+        print(f"     Total pool:      ${total_pool:,.0f}")
+    if remaining is not None:
+        print(f"     Remaining:       ${remaining:,.0f}")
+    if competitive != "?":
+        print(f"     Competitiveness: {competitive}")
+    print(f"{'─'*55}\n")
