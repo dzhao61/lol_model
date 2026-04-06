@@ -25,7 +25,10 @@ List recent LoL markets:
 """
 
 import argparse
+import json
+import pickle
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -37,7 +40,114 @@ from scripts.polymarket_client import (
     get_mid_price, print_market_summary, post_two_sided_quote,
     cancel_all_orders, get_open_orders,
 )
-from pipeline.betting import market_maker_quotes, QuoteParams, fee_table, taker_fee_per_share
+from pipeline.betting import (
+    market_maker_quotes, QuoteParams, fee_table, taker_fee_per_share,
+    PositionState, compute_half_spread,
+)
+from pipeline.models import ensemble_predict
+
+
+# ─── Fill monitoring ─────────────────────────────────────────────────────────
+
+def monitor_fills(
+    condition_id: str,
+    posted_bid_id: str | None,
+    posted_ask_id: str | None,
+    yes_token_id: str,
+    p_fair: float = 0.5,
+    size: float = 30.0,
+    interval: int = 30,
+    max_checks: int = 60,
+) -> None:
+    """
+    Poll for fills and implement adverse selection defense.
+
+    After posting orders, checks every `interval` seconds.
+    If one side fills and the market moves against us by > 2 cents,
+    cancels the remaining side to prevent being picked off.
+
+    Parameters
+    ----------
+    condition_id   : market condition ID
+    posted_bid_id  : order ID for the bid (YES buy)
+    posted_ask_id  : order ID for the ask (NO buy)
+    yes_token_id   : YES token ID for price checks
+    interval       : seconds between checks
+    max_checks     : max number of checks before stopping
+    """
+    import time
+    from scripts.polymarket_client import get_orderbook_snapshot
+
+    position = PositionState()
+    bid_alive = posted_bid_id is not None
+    ask_alive = posted_ask_id is not None
+
+    print(f"\nMonitoring fills (every {interval}s, up to {max_checks} checks)...")
+    print(f"  Bid order: {posted_bid_id[:12] if posted_bid_id else 'none'}")
+    print(f"  Ask order: {posted_ask_id[:12] if posted_ask_id else 'none'}")
+    print(f"  Press Ctrl+C to stop.\n")
+
+    initial_snap = get_orderbook_snapshot(yes_token_id)
+    initial_mid = initial_snap.get("mid")
+
+    for check in range(max_checks):
+        try:
+            time.sleep(interval)
+        except KeyboardInterrupt:
+            print("\nMonitoring stopped by user.")
+            return
+
+        # Check which orders are still open
+        open_orders = get_open_orders(condition_id)
+        open_ids = {o.get("id") for o in open_orders}
+
+        bid_filled = bid_alive and posted_bid_id not in open_ids
+        ask_filled = ask_alive and posted_ask_id not in open_ids
+
+        if bid_filled:
+            position.update_fill("YES", size, p_fair)
+            print(f"  [{check+1}] BID FILLED (YES buy)  exposure={position.net_exposure(p_fair):+.2f}")
+            bid_alive = False
+        if ask_filled:
+            position.update_fill("NO", size, 1.0 - p_fair)
+            print(f"  [{check+1}] ASK FILLED (NO buy)  exposure={position.net_exposure(p_fair):+.2f}")
+            ask_alive = False
+
+        if not bid_alive and not ask_alive:
+            print(f"\n  Both sides filled — spread captured!")
+            return
+
+        # One side filled: check for adverse selection
+        if (bid_filled or ask_filled) and (bid_alive or ask_alive):
+            snap = get_orderbook_snapshot(yes_token_id)
+            current_mid = snap.get("mid")
+
+            if initial_mid and current_mid:
+                move = current_mid - initial_mid
+                print(f"  Market moved: {move:+.3f} since order post")
+
+                # Adverse selection: market moved against our filled position
+                adverse = False
+                if bid_filled and move < -0.02:
+                    # We bought YES, market dropped → adverse
+                    adverse = True
+                    print(f"  ⚠ ADVERSE: bought YES but market dropped {move:.3f}")
+                elif ask_filled and move > 0.02:
+                    # We bought NO, market rose → adverse
+                    adverse = True
+                    print(f"  ⚠ ADVERSE: bought NO but market rose {move:+.3f}")
+
+                if adverse:
+                    remaining = "bid" if bid_alive else "ask"
+                    print(f"  Cancelling remaining {remaining} to limit exposure...")
+                    cancel_all_orders(condition_id)
+                    print(f"  Done — adverse selection defense triggered.")
+                    return
+
+        if not bid_filled and not ask_filled:
+            print(f"  [{check+1}] Both orders still resting...")
+
+    print(f"\nMax checks reached ({max_checks}). Stopping monitor.")
 
 
 # ─── Main workflow ────────────────────────────────────────────────────────────
@@ -81,12 +191,38 @@ def run(args):
         "game":     args.game,
     }
 
-    # Step 1: model prediction
-    print("Step 1 — Loading model and predicting...")
-    bundle  = load_bundle()
+    # Step 1: model prediction (ensemble over all bundles)
+    print("Step 1 — Loading models and predicting (ensemble)...")
     feat_df = load_feat_df()
-    pred    = predict_match(args.team1, args.team2, context, bundle, feat_df, verbose=True)
-    p_model = pred["p_model"]
+
+    weights_path = ROOT / "cache" / "ensemble_weights.json"
+    ensemble_weights = json.load(open(weights_path)) if weights_path.exists() else None
+
+    all_preds: dict[str, float] = {}
+    first_pred = None
+    for bpath in sorted((ROOT / "cache").glob("model_bundle_*.pkl")):
+        key = bpath.stem.replace("model_bundle_", "")
+        if not key:
+            continue
+        bundle = pickle.load(open(bpath, "rb"))
+        try:
+            r = predict_match(args.team1, args.team2, context, bundle, feat_df,
+                              verbose=(first_pred is None))
+            all_preds[key] = r["p_model"]
+            if first_pred is None:
+                first_pred = r
+        except Exception as e:
+            print(f"  [{key}] failed: {e}")
+
+    if not all_preds:
+        print("ERROR: all model predictions failed.")
+        sys.exit(1)
+
+    p_model, model_std = ensemble_predict(all_preds, weights=ensemble_weights)
+    weight_mode = "weighted" if ensemble_weights else "equal weights"
+    print(f"\n  Ensemble: p={p_model:.3f}  σ={model_std:.4f}  ({len(all_preds)} models, {weight_mode})")
+    for k, p in sorted(all_preds.items()):
+        print(f"    {k:<15} {p:.3f}")
 
     # Optional: show series probability
     if args.format != "Bo1":
@@ -121,17 +257,36 @@ def run(args):
     if p_market is None:
         p_market = float(input("Enter current Polymarket mid price (e.g. 0.55): ").strip())
 
+    # Compute hours until match from market end date
+    hours_to_match = 168.0
+    if market and market.end_date:
+        try:
+            end_dt = datetime.fromisoformat(market.end_date.replace("Z", "+00:00"))
+            hours_to_match = max(0.0, (end_dt - datetime.now(timezone.utc)).total_seconds() / 3600)
+        except Exception:
+            pass
+
     # Step 3: compute quotes
     print("Step 3 — Computing quotes...")
 
+    # Dynamic spread: widens near match and when models disagree
+    dyn_spread = compute_half_spread(
+        model_std=model_std,
+        hours_to_match=hours_to_match,
+        edge_abs=abs(p_model - p_market),
+        base=args.half_spread,
+    )
+
     params = QuoteParams(
-        half_spread   = args.half_spread,
+        half_spread   = dyn_spread,
         min_edge      = args.min_edge,
         max_inventory = 0.05,
         kelly_frac    = 0.25,
     )
 
-    quote = market_maker_quotes(p_model, p_market, params)
+    quote = market_maker_quotes(p_model, p_market, params,
+                                model_std=model_std,
+                                hours_to_match=hours_to_match)
 
     fee    = taker_fee_per_share(p_market)
     bankroll = args.bankroll
@@ -139,9 +294,12 @@ def run(args):
     print(f"\n{'─'*55}")
     print(f"  Quote summary")
     print(f"{'─'*55}")
-    print(f"  p_model:          {p_model:.3f}")
+    print(f"  p_model:          {p_model:.3f}  (σ={model_std:.4f})")
+    print(f"  p_fair (blended): {quote.mid:.3f}  (α={quote.alpha:.2f})")
     print(f"  p_market (mid):   {p_market:.3f}")
     print(f"  Edge:             {quote.edge:+.3f}")
+    print(f"  Hours to match:   {hours_to_match:.1f}h")
+    print(f"  Half-spread:      {dyn_spread:.4f}  (dynamic, base={args.half_spread:.4f})")
     print(f"  Taker fee:        {fee:.4f}  (at this price)")
     print(f"  Net taker edge:   {quote.net_taker_edge:+.4f}")
     print(f"")
@@ -203,6 +361,18 @@ def run(args):
         print(f"  Ask order ID: {posted.ask_order_id}")
         print(f"\n⚠ Remember to cancel orders before match starts:")
         print(f"  python -m scripts.run_maker --cancel --condition-id {market.condition_id}")
+
+        # Optional: monitor fills for adverse selection
+        if args.monitor:
+            monitor_fills(
+                condition_id=market.condition_id,
+                posted_bid_id=posted.bid_order_id,
+                posted_ask_id=posted.ask_order_id,
+                yes_token_id=market.yes_token_id,
+                p_fair=quote.mid,
+                size=args.size,
+                interval=args.monitor_interval,
+            )
     else:
         print("Step 4 — Dry run (add --live to post real orders):")
         TICK = 0.01
@@ -246,11 +416,11 @@ def main():
                         help="Polymarket condition_id for the market")
 
     # Quoting
-    parser.add_argument("--half-spread",  type=float, default=0.03)
+    parser.add_argument("--half-spread",  type=float, default=0.015)
     parser.add_argument("--min-edge",     type=float, default=0.02)
     parser.add_argument("--bankroll",     type=float, default=200.0)
-    parser.add_argument("--size",         type=float, default=100.0,
-                        help="Shares per side for quotes")
+    parser.add_argument("--size",         type=float, default=30.0,
+                        help="Shares per side for quotes (default: 30)")
 
     # Modes
     parser.add_argument("--live",         action="store_true",
@@ -263,6 +433,10 @@ def main():
                         help="Filter for --list-markets (e.g. 'T1')")
     parser.add_argument("--show-fees",    action="store_true",
                         help="Print the fee/rebate table")
+    parser.add_argument("--monitor",      action="store_true",
+                        help="Monitor fills after posting (adverse selection defense)")
+    parser.add_argument("--monitor-interval", type=int, default=30,
+                        help="Seconds between fill checks (default: 30)")
 
     args = parser.parse_args()
     run(args)

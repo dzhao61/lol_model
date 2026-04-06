@@ -55,7 +55,7 @@ N_TUNE_ITER   = 100      # RandomizedSearchCV iterations per model
 INCLUDE_PATCH_FEATURES   = True
 INCLUDE_STYLE_FEATURES   = True   # Group F – ablate to test if they add signal
 INCLUDE_INTERACTIONS     = True   # Group K – explicit pairwise interaction terms
-INCLUDE_ROSTER_FEATURES  = False  # Tier 3 – needs player rows; off by default
+INCLUDE_ROSTER_FEATURES  = True   # Group R – roster stability signal
 
 # ─── Elo time-decay ───────────────────────────────────────────────────────────
 # Decayed Elo: before each match, Elo regresses toward 1500 with this half-life.

@@ -9,7 +9,9 @@ import math
 import re
 import sys
 import time
+import json
 import warnings
+from datetime import datetime, timezone
 from difflib import get_close_matches
 from pathlib import Path
 
@@ -122,6 +124,15 @@ MODEL_LABEL = {
     "elasticnet": "ElasticNet",
     "logistic":   "Logistic",
 }
+
+# Reverse map: label → model key (for weight lookup)
+_LABEL_TO_KEY = {v: k for k, v in MODEL_LABEL.items()}
+
+# Load ensemble weights if available (keyed by model name)
+_ens_weights_path = CACHE_DIR / "ensemble_weights.json"
+_ENSEMBLE_WEIGHTS_RAW = (
+    json.load(open(_ens_weights_path)) if _ens_weights_path.exists() else None
+)
 
 
 @st.cache_resource
@@ -603,9 +614,9 @@ with left_col:
 
     s1, s2 = st.columns(2)
     with s1:
-        half_spread = st.number_input("Half-spread (¢)", 1, value=3, step=1) / 100
+        half_spread = st.number_input("Half-spread (¢)", 1, value=2, step=1) / 100
     with s2:
-        quote_size  = st.number_input("Shares / side", 5, value=100, step=5)
+        quote_size  = st.number_input("Shares / side", 5, value=30, step=5)
 
     # Team name overrides (collapsed)
     # Keys are scoped to condition_id so stale widget state never bleeds across markets.
@@ -732,9 +743,23 @@ with right_col:
                 f"</tr>"
             )
 
-        # Consensus row
+        # Ensemble row (inverse-log-loss weighted)
         if p_series_list:
-            p_avg     = sum(p_series_list) / len(p_series_list)
+            from pipeline.models import ensemble_predict
+            # Build model_probs dict for ensemble
+            _ens_probs = {}
+            for rd in rows_data:
+                if "error" not in rd:
+                    _ens_probs[rd["label"]] = rd["p1"]
+            _label_weights = None
+            if _ENSEMBLE_WEIGHTS_RAW:
+                _label_weights = {
+                    lbl: _ENSEMBLE_WEIGHTS_RAW[_LABEL_TO_KEY[lbl]]
+                    for lbl in _ens_probs
+                    if _LABEL_TO_KEY.get(lbl) in _ENSEMBLE_WEIGHTS_RAW
+                }
+            p_avg, _model_std = ensemble_predict(_ens_probs, weights=_label_weights)
+            st.session_state["_model_std"] = _model_std
             avg_ey    = p_avg - p_market_yes
             avg_en    = (1.0 - p_avg) - (1.0 - p_market_yes)
             ey_cls    = _edge_class(avg_ey)
@@ -743,7 +768,7 @@ with right_col:
             n_tot     = sum(1 for rd in rows_data if "error" not in rd)
             body_rows += (
                 f"<tr class='consensus'>"
-                f"<td>Consensus ({n_pos_yes}/{n_tot} YES)</td>"
+                f"<td>Ensemble ({n_pos_yes}/{n_tot} YES, σ={_model_std:.3f})</td>"
                 f"<td>{p_avg:.1%}</td>"
                 f"<td>{1-p_avg:.1%}</td>"
                 f"<td class='{ey_cls}'>{_edge_str(avg_ey)}</td>"
@@ -785,12 +810,26 @@ with right_col:
         r_chosen = model_results[model_choice]
         p_game   = r_chosen["p_model"]
         p_ser    = series_win_prob(p_game, series_fmt) if series_fmt in ("Bo3", "Bo5") else p_game
-        p_fair   = p_ser if prob_choice == "Series" else p_game
+        p_model_raw = p_ser if prob_choice == "Series" else p_game
 
         TICK     = 0.01
         fee      = taker_fee_per_share(p_market_yes)
 
-        # Raw model-based quotes centered on p_fair
+        # Blend model probability with market price for fair value
+        from pipeline.betting import compute_fair_value
+        _mstd = st.session_state.get("_model_std", 0.0)
+        _hours_to_match = 168.0
+        if sel_market.end_date:
+            try:
+                _end_dt = datetime.fromisoformat(sel_market.end_date.replace("Z", "+00:00"))
+                _hours_to_match = max(0.0, (_end_dt - datetime.now(timezone.utc)).total_seconds() / 3600)
+            except Exception:
+                pass
+        p_fair, alpha_used = compute_fair_value(
+            p_model_raw, p_market_yes, model_std=_mstd, hours_to_match=_hours_to_match,
+        )
+
+        # Quotes centered on blended fair value
         q_bid_raw = max(0.01, round(math.floor((p_fair - half_spread) / TICK) * TICK, 4))
         q_ask_raw = min(0.99, round(math.ceil( (p_fair + half_spread) / TICK) * TICK, 4))
 
@@ -896,8 +935,11 @@ with right_col:
 
             # ── Summary stats row ────────────────────────────────────────────
             f'<div style="display:flex;gap:24px;padding:8px 2px;border-top:1px solid #2d3748;flex-wrap:wrap">'
-            f'<div><span style="color:#718096;font-size:11px">Model fair value</span>  '
-            f'<b style="font-size:12px">{p_fair*100:.0f}¢</b></div>'
+            f'<div><span style="color:#718096;font-size:11px">Model raw</span>  '
+            f'<b style="font-size:12px">{p_model_raw*100:.0f}¢</b></div>'
+            f'<div><span style="color:#718096;font-size:11px">Blended fair value</span>  '
+            f'<b style="font-size:12px">{p_fair*100:.0f}¢</b>  '
+            f'<span style="color:#718096;font-size:10px">(α={alpha_used:.0%})</span></div>'
             f'<div><span style="color:#718096;font-size:11px">Market mid</span>  '
             f'<b style="font-size:12px">{(p_market_yes or 0)*100:.0f}¢</b></div>'
             f'<div><span style="color:#718096;font-size:11px">USDC reserved</span>  '

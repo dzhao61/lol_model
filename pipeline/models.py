@@ -124,13 +124,14 @@ MODEL_REGISTRY: dict[str, tuple] = {
             min_child_weight=10,
         ),
         {
-            "clf__n_estimators":     [100, 200, 300, 500],
-            "clf__max_depth":        [3, 4, 5, 6],
-            "clf__learning_rate":    [0.01, 0.05, 0.1],
-            "clf__subsample":        [0.7, 0.8, 1.0],
-            "clf__colsample_bytree": [0.7, 0.8, 1.0],
-            "clf__reg_lambda":       [1, 3, 5, 10],
-            "clf__min_child_weight": [1, 5, 10],
+            "clf__n_estimators":     [200, 500, 750, 1000, 1500],
+            "clf__max_depth":        [3, 4, 5, 6, 7],
+            "clf__learning_rate":    [0.005, 0.01, 0.02, 0.05, 0.1],
+            "clf__subsample":        [0.6, 0.7, 0.8, 1.0],
+            "clf__colsample_bytree": [0.5, 0.6, 0.7, 0.8],
+            "clf__reg_lambda":       [0.1, 0.3, 0.5, 1, 3, 5, 10],
+            "clf__min_child_weight": [1, 5, 10, 20],
+            "clf__gamma":            [0, 0.1, 0.3, 0.5, 1.0],
         },
     ),
 }
@@ -296,3 +297,54 @@ def summarise_cv(cv_df: pd.DataFrame) -> pd.DataFrame:
         .agg(["mean", "std"])
         .round(5)
     )
+
+
+# ─── Ensemble ────────────────────────────────────────────────────────────────
+
+def compute_ensemble_weights(
+    cv_scores: dict[str, float],
+) -> dict[str, float]:
+    """
+    Compute inverse-log-loss weights for ensemble averaging.
+
+    Parameters
+    ----------
+    cv_scores : {model_label: mean_cv_log_loss}
+
+    Returns
+    -------
+    {model_label: weight}  (weights sum to 1)
+    """
+    inv = {m: 1.0 / ll for m, ll in cv_scores.items()}
+    total = sum(inv.values())
+    return {m: v / total for m, v in inv.items()}
+
+
+def ensemble_predict(
+    model_probs: dict[str, float],
+    weights: dict[str, float] | None = None,
+) -> tuple[float, float]:
+    """
+    Weighted average of model probabilities.
+
+    Parameters
+    ----------
+    model_probs : {model_label: p_model}
+    weights     : {model_label: weight} — if None, uses equal weights
+
+    Returns
+    -------
+    (p_ensemble, model_std) : weighted mean and std of model predictions
+    """
+    labels = list(model_probs.keys())
+    probs  = np.array([model_probs[l] for l in labels])
+
+    if weights is None:
+        w = np.ones(len(probs)) / len(probs)
+    else:
+        w = np.array([weights.get(l, 1.0 / len(probs)) for l in labels])
+        w = w / w.sum()
+
+    p_ens = float(np.dot(w, probs))
+    p_std = float(np.std(probs))  # unweighted std — measure of disagreement
+    return p_ens, p_std

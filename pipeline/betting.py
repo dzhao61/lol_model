@@ -55,6 +55,56 @@ import numpy as np
 import pandas as pd
 from dataclasses import dataclass, field
 
+# ─── Position tracking ───────────────────────────────────────────────────────
+
+@dataclass
+class PositionState:
+    """Tracks current inventory in a single market."""
+    yes_shares:           float = 0.0    # YES tokens held
+    no_shares:            float = 0.0    # NO tokens held
+    avg_cost_yes:         float = 0.0    # avg entry price for YES
+    avg_cost_no:          float = 0.0    # avg entry price for NO
+    total_capital_deployed: float = 0.0  # total USDC committed
+
+    def update_fill(self, side: str, shares: float, price: float) -> None:
+        """Record a fill. side = 'YES' or 'NO'."""
+        cost = shares * price
+        if side == "YES":
+            total = self.yes_shares + shares
+            if total > 0:
+                self.avg_cost_yes = (
+                    (self.avg_cost_yes * self.yes_shares + cost) / total
+                )
+            self.yes_shares = total
+        else:
+            total = self.no_shares + shares
+            if total > 0:
+                self.avg_cost_no = (
+                    (self.avg_cost_no * self.no_shares + cost) / total
+                )
+            self.no_shares = total
+        self.total_capital_deployed += cost
+
+    def net_exposure(self, p_fair: float) -> float:
+        """Dollar-signed net exposure (positive = long YES)."""
+        return self.yes_shares * p_fair - self.no_shares * (1.0 - p_fair)
+
+    def inventory_skew(self, p_fair: float, max_position: float, half_spread: float) -> float:
+        """
+        Compute skew to reduce inventory.
+        Positive skew = raise both bid & ask (offload YES).
+        Negative skew = lower both bid & ask (offload NO).
+        """
+        if max_position <= 0:
+            return 0.0
+        net = self.net_exposure(p_fair)
+        return -(net / max_position) * half_spread * 0.5
+
+    @property
+    def is_flat(self) -> bool:
+        return self.yes_shares == 0 and self.no_shares == 0
+
+
 # ─── Fee constants (LoL/Esports = Sports category) ────────────────────────────
 
 TICK_SIZE            = 0.01     # typical for LoL markets (verify per market)
@@ -114,6 +164,52 @@ def maker_rebate_per_share(p: float, rate: float = SPORTS_TAKER_RATE) -> float:
     return float(MAKER_REBATE_FRAC * taker_fee_per_share(p, rate))
 
 
+def compute_half_spread(
+    model_std:       float = 0.0,
+    hours_to_match:  float = 168.0,
+    edge_abs:        float = 0.0,
+    base:            float = 0.015,
+) -> float:
+    """
+    Compute dynamic half-spread based on risk conditions.
+
+    Tighter spread → higher liquidity reward score (quadratic).
+    Wider spread → less adverse selection risk.
+
+    Parameters
+    ----------
+    model_std        : std of model predictions (disagreement measure)
+    hours_to_match   : hours until match starts
+    edge_abs         : absolute model-market edge
+    base             : base half-spread (default 1.5 cents)
+
+    Returns
+    -------
+    float : recommended half-spread in price units
+    """
+    # Uncertainty adjustment: widen when models disagree
+    uncertainty_adj = min(model_std * 2.0, 0.01)
+
+    # Time adjustment: widen as match approaches (higher adverse selection risk)
+    if hours_to_match < 2:
+        time_adj = 0.02     # last 2 hours: significant risk
+    elif hours_to_match < 12:
+        time_adj = 0.01
+    elif hours_to_match < 24:
+        time_adj = 0.005
+    else:
+        time_adj = 0.0
+
+    half_spread = base + uncertainty_adj + time_adj
+
+    # If farming rewards with no real edge, stay tight
+    if edge_abs < 0.01:
+        half_spread = min(half_spread, base + 0.005)
+
+    # Never exceed max reward qualifying spread
+    return min(half_spread, DEFAULT_MAX_REWARD_SPREAD)
+
+
 def compute_edge(p_model: float, p_market: float) -> float:
     """
     Signed model vs market edge (no fee adjustment).
@@ -121,6 +217,72 @@ def compute_edge(p_model: float, p_market: float) -> float:
     Negative → model thinks NO is underpriced.
     """
     return float(p_model) - float(p_market)
+
+
+# ─── Fair value blending ─────────────────────────────────────────────────────
+
+def compute_alpha(
+    model_std:       float = 0.0,
+    n_games_min:     int   = 30,
+    hours_to_match:  float = 168.0,   # default: 7 days out
+) -> float:
+    """
+    Compute model confidence weight (alpha) for fair value blending.
+
+    Higher alpha = trust model more. Lower = lean toward market.
+
+    Parameters
+    ----------
+    model_std        : std deviation of predictions across ensemble models
+    n_games_min      : min games played by either team (sample size proxy)
+    hours_to_match   : hours until match starts (market becomes more informed closer to event)
+
+    Returns
+    -------
+    float : alpha in [0.30, 0.80]
+    """
+    base = 0.65
+    # Models disagree → less confidence in model fair value
+    disagreement_penalty = min(model_std * 5.0, 0.15)
+    # Few prior games → less reliable rolling features
+    sample_penalty = max(0.0, 0.10 * (1.0 - n_games_min / 30.0))
+    # Closer to match → market is more informed (roster leaks, scrims, etc.)
+    time_penalty = max(0.0, 0.10 * (1.0 - hours_to_match / (7.0 * 24.0)))
+    alpha = base - disagreement_penalty - sample_penalty - time_penalty
+    return max(0.30, min(0.80, alpha))
+
+
+def compute_fair_value(
+    p_model:         float,
+    p_market:        float,
+    alpha:           float | None = None,
+    model_std:       float = 0.0,
+    n_games_min:     int   = 30,
+    hours_to_match:  float = 168.0,
+) -> tuple[float, float]:
+    """
+    Blend model probability with market price to produce fair value.
+
+    The market incorporates information the model can't see (roster news,
+    scrim results, meta reads). Blending reduces exposure to model-only errors.
+
+    Parameters
+    ----------
+    p_model         : model's predicted probability of YES
+    p_market        : current Polymarket mid price
+    alpha           : override confidence weight (if None, computed dynamically)
+    model_std       : std of model predictions across ensemble (for dynamic alpha)
+    n_games_min     : min games played by either team
+    hours_to_match  : hours until match
+
+    Returns
+    -------
+    (p_fair, alpha_used) : blended fair value and the alpha weight used
+    """
+    if alpha is None:
+        alpha = compute_alpha(model_std, n_games_min, hours_to_match)
+    p_fair = alpha * float(p_model) + (1.0 - alpha) * float(p_market)
+    return float(np.clip(p_fair, 0.02, 0.98)), alpha
 
 
 # ─── Kelly criterion ─────────────────────────────────────────────────────────
@@ -292,7 +454,7 @@ def estimate_liquidity_reward(
 @dataclass
 class QuoteParams:
     """Configuration for market-making quotes."""
-    half_spread:      float = 0.03   # distance from mid to each side (3 cents)
+    half_spread:      float = 0.015  # distance from mid to each side (1.5 cents)
     min_edge:         float = 0.02   # minimum |model − market| to post directional intent
     inventory_skew:   float = 0.0    # positive = skew ask up (long), negative = skew bid down
     max_inventory:    float = 0.10   # max bankroll fraction in a single position
@@ -305,8 +467,10 @@ class Quote:
     """Output of the market-making quote engine."""
     bid:              float          # price to buy YES
     ask:              float          # price to sell YES
-    mid:              float          # model fair value
+    mid:              float          # blended fair value (model + market)
+    p_model:          float          # raw model probability
     market_mid:       float          # observed market price
+    alpha:            float          # blending weight used (1=pure model, 0=pure market)
     edge:             float          # signed model vs market edge
     net_taker_edge:   float          # edge minus taker fee (break-even check)
     bet_direction:    str            # "YES", "NO", or "PASS"
@@ -317,25 +481,34 @@ class Quote:
 
 
 def market_maker_quotes(
-    p_model:  float,
-    p_market: float,
-    params:   QuoteParams | None = None,
+    p_model:          float,
+    p_market:         float,
+    params:           QuoteParams | None = None,
+    model_std:        float = 0.0,
+    n_games_min:      int   = 30,
+    hours_to_match:   float = 168.0,
+    blend_alpha:      float | None = None,
 ) -> Quote:
     """
     Compute bid/ask quotes for a Polymarket YES/NO market.
 
-    The model acts as the source of fair value. Quotes are snapped to tick size.
+    Fair value is a blend of model probability and market price:
+        p_fair = alpha × p_model + (1 - alpha) × p_market
+    This incorporates information the model can't see (roster news, scrims).
+
+    Quotes are centered on the blended fair value and snapped to tick size.
     When the model's edge vs market is large, quotes are skewed to accumulate
     inventory on the value side.
 
-    Taker fee: fee_rate × p × (1−p) — curve-based, highest at p=0.50.
-    Maker rebate: 25% of taker fee — paid when our resting order is taken.
-
     Parameters
     ----------
-    p_model  : model probability of YES (your fair value)
-    p_market : current Polymarket market mid price
-    params   : QuoteParams controlling spread, edge threshold, skew
+    p_model          : model probability of YES
+    p_market         : current Polymarket market mid price
+    params           : QuoteParams controlling spread, edge threshold, skew
+    model_std        : std of predictions across ensemble models (for alpha)
+    n_games_min      : min games played by either team (for alpha)
+    hours_to_match   : hours until match starts (for alpha)
+    blend_alpha      : override blending weight (None = compute dynamically)
 
     Returns
     -------
@@ -347,13 +520,22 @@ def market_maker_quotes(
     p_model  = float(np.clip(p_model,  0.02, 0.98))
     p_market = float(np.clip(p_market, 0.02, 0.98))
 
-    edge     = compute_edge(p_model, p_market)
+    # Blend model + market to produce fair value
+    p_fair, alpha_used = compute_fair_value(
+        p_model, p_market,
+        alpha=blend_alpha,
+        model_std=model_std,
+        n_games_min=n_games_min,
+        hours_to_match=hours_to_match,
+    )
+
+    edge     = compute_edge(p_model, p_market)   # raw model vs market edge
     fee      = taker_fee_per_share(p_market)
     net_edge = abs(edge) - fee           # positive = worth taking as a taker
 
-    # Inventory skew: lean toward value side
+    # Inventory skew: lean toward value side (based on raw model edge)
     skew = -np.sign(edge) * abs(edge) * 0.3 + params.inventory_skew
-    mid  = _snap(p_model)
+    mid  = _snap(p_fair)
     bid  = _snap(mid - params.half_spread + skew)
     ask  = _snap(mid + params.half_spread + skew)
 
@@ -361,11 +543,11 @@ def market_maker_quotes(
     bid = float(np.clip(bid, MIN_PRICE, mid - TICK_SIZE))
     ask = float(np.clip(ask, mid + TICK_SIZE, MAX_PRICE))
 
-    # Reward scores for each side (measure tightness vs qualifying spread)
+    # Reward scores for each side (per-share score, pass size=1)
     bid_spread = abs(p_market - bid)
     ask_spread = abs(ask - p_market)
-    bid_score  = order_reward_score(bid_spread, 0, params.max_reward_spread)  # size=0: score per share
-    ask_score  = order_reward_score(ask_spread, 0, params.max_reward_spread)
+    bid_score  = order_reward_score(bid_spread, 1, params.max_reward_spread)
+    ask_score  = order_reward_score(ask_spread, 1, params.max_reward_spread)
 
     # Directional sizing: Kelly only if net_edge > 0 and |edge| >= min_edge
     if abs(edge) >= params.min_edge:
@@ -378,14 +560,17 @@ def market_maker_quotes(
 
     rebate = maker_rebate_per_share(p_market)
     rationale = (
-        f"Model={p_model:.3f}  Market={p_market:.3f}  Edge={edge:+.3f}  "
+        f"Model={p_model:.3f}  Fair={p_fair:.3f}(α={alpha_used:.2f})  "
+        f"Market={p_market:.3f}  Edge={edge:+.3f}  "
         f"TakerFee={fee:.4f}  NetEdge={net_edge:+.4f}  Rebate={rebate:.5f}  "
         f"→ {bet_dir}  Kelly={k_size:.3f}"
     )
 
     return Quote(
         bid=bid, ask=ask, mid=mid,
+        p_model=p_model,
         market_mid=p_market,
+        alpha=alpha_used,
         edge=edge,
         net_taker_edge=net_edge,
         bet_direction=bet_dir,
