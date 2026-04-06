@@ -1,0 +1,68 @@
+11:55:35  INFO     run_pipeline  Loaded from cache: team_df.parquet  (191822 rows)
+11:55:35  INFO     run_pipeline  Loaded from cache: elo_df.parquet  (191822 rows)
+11:55:35  INFO     run_pipeline  Loaded from cache: feat_df.parquet  (191822 rows)
+11:55:35  INFO     run_pipeline  Loaded from cache: dataset_df.parquet  (192548 rows)
+11:55:35  INFO     run_pipeline  Loaded from cache: dev_df.parquet  (153754 rows)
+11:55:35  INFO     run_pipeline  Loaded from cache: hold_df.parquet  (38794 rows)
+11:55:35  INFO     run_pipeline  Loaded 246 folds from cache
+11:55:35  INFO     run_pipeline  Feature columns: 240 numeric, 4 categorical
+11:55:35  INFO     run_pipeline  ━━━ STAGE 6: Rolling CV (246 folds) ━━━
+11:56:05  INFO     pipeline.models  CV progress: fold 20 / 246
+11:56:49  INFO     pipeline.models  CV progress: fold 40 / 246
+11:58:07  INFO     pipeline.models  CV progress: fold 60 / 246
+12:01:16  INFO     pipeline.models  CV progress: fold 80 / 246
+12:03:03  INFO     pipeline.models  CV progress: fold 100 / 246
+12:05:08  INFO     pipeline.models  CV progress: fold 120 / 246
+12:07:48  INFO     pipeline.models  CV progress: fold 140 / 246
+12:11:10  INFO     pipeline.models  CV progress: fold 160 / 246
+12:18:32  INFO     pipeline.models  CV progress: fold 180 / 246
+12:29:24  INFO     pipeline.models  CV progress: fold 200 / 246
+12:35:51  INFO     pipeline.models  CV progress: fold 220 / 246
+12:45:01  INFO     pipeline.models  CV progress: fold 240 / 246
+12:46:22  INFO     pipeline.models  CV progress: fold 246 / 246
+12:46:22  INFO     run_pipeline  CV complete in 3047.0s
+12:46:22  INFO     run_pipeline  
+CV Summary:
+              log_loss             brier          accuracy         
+                  mean      std     mean      std     mean      std
+model                                                              
+lasso_lr       0.65034  0.03583  0.22949  0.01649  0.61869  0.06525
+logistic       0.68270  0.13139  0.23793  0.03227  0.60927  0.06591
+random_forest  0.65125  0.03794  0.22989  0.01763  0.61231  0.06185
+ridge_lr       0.64978  0.04481  0.22908  0.02019  0.61574  0.06615
+xgboost        0.65565  0.04619  0.23170  0.02079  0.61257  0.05862
+12:46:22  INFO     run_pipeline  ━━━ STAGE 7: Hyperparameter tuning ━━━
+12:46:22  INFO     pipeline.tuning  Tuning on 30 folds (last 30 of 246 total)
+12:46:22  INFO     pipeline.tuning  Tuning xgboost (20 iterations × 30 folds) ...
+12:54:27  INFO     pipeline.tuning  xgboost          best log_loss=0.64056  params={'n_estimators': 500, 'max_depth': 5, 'learning_rate': 0.01, 'subsample': 0.8, 'colsample_bytree': 1.0, 'reg_lambda': 1, 'min_child_weight': 5}
+12:54:27  INFO     pipeline.tuning  Tuning random_forest (20 iterations × 30 folds) ...
+14:28:50  INFO     pipeline.tuning  random_forest    best log_loss=0.64184  params={'n_estimators': 300, 'max_depth': None, 'max_features': 0.3, 'min_samples_leaf': 20}
+14:28:50  INFO     pipeline.tuning  Tuning lasso_lr (20 iterations × 30 folds) ...
+15:44:21  INFO     pipeline.tuning  lasso_lr         best log_loss=0.63917  params={'C': 0.01}
+15:44:21  INFO     pipeline.tuning  Tuning ridge_lr (20 iterations × 30 folds) ...
+15:45:02  INFO     pipeline.tuning  ridge_lr         best log_loss=0.63871  params={'C': 0.001}
+15:45:02  INFO     pipeline.tuning  logistic         no params to tune – using defaults
+15:45:02  INFO     pipeline.tuning  Saved best params to /Users/danielzhao/MyMac/Masters Degree/Personal Projects/LoLPredictor/lol_model/cache/best_params.json
+15:45:02  INFO     run_pipeline  Tuning complete in 10720.1s
+15:45:02  INFO     run_pipeline  ━━━ STAGE 8: Final holdout evaluation ━━━
+15:45:17  INFO     pipeline.evaluation  Holdout xgboost          log_loss=0.62308  brier=0.21730  acc=0.6445
+15:48:54  INFO     pipeline.evaluation  Holdout random_forest    log_loss=0.62727  brier=0.21911  acc=0.6413
+15:50:19  INFO     pipeline.evaluation  Holdout lasso_lr         log_loss=0.62228  brier=0.21701  acc=0.6465
+15:50:20  INFO     pipeline.evaluation  Holdout ridge_lr         log_loss=0.62206  brier=0.21692  acc=0.6466
+15:50:23  INFO     pipeline.evaluation  Holdout logistic         log_loss=0.62209  brier=0.21695  acc=0.6467
+15:50:23  INFO     run_pipeline  
+Holdout Summary:
+               log_loss    brier  accuracy
+model                                     
+xgboost         0.62308  0.21730   0.64448
+random_forest   0.62727  0.21911   0.64126
+lasso_lr        0.62228  0.21701   0.64649
+ridge_lr        0.62206  0.21692   0.64657
+logistic        0.62209  0.21695   0.64670
+baseline        0.69310  0.25000   0.50000
+15:50:23  INFO     pipeline.evaluation  Saved /Users/danielzhao/MyMac/Masters Degree/Personal Projects/LoLPredictor/lol_model/outputs/cv_log_loss.png
+15:50:23  INFO     pipeline.evaluation  Saved /Users/danielzhao/MyMac/Masters Degree/Personal Projects/LoLPredictor/lol_model/outputs/cv_log_loss_over_time.png
+15:50:23  INFO     pipeline.evaluation  Saved /Users/danielzhao/MyMac/Masters Degree/Personal Projects/LoLPredictor/lol_model/outputs/calibration.png
+15:54:24  INFO     pipeline.evaluation  Saved /Users/danielzhao/MyMac/Masters Degree/Personal Projects/LoLPredictor/lol_model/outputs/feature_importance.png
+15:54:24  INFO     run_pipeline  Final evaluation complete in 561.2s
+15:54:24  INFO     run_pipeline  ━━━ STAGE 9: Ablation study ━━━

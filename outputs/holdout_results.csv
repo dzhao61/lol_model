@@ -1,0 +1,7 @@
+model,log_loss,brier,accuracy
+lasso_lr,0.6331,0.22174,0.63334
+ridge_lr,0.63318,0.22176,0.63395
+elasticnet,0.63299,0.2217,0.63316
+logistic,0.63336,0.22185,0.63525
+xgboost,0.62898,0.21994,0.63719
+baseline,0.6931,0.25,0.5
