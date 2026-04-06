@@ -5,6 +5,7 @@ Run with:
     streamlit run app.py
 """
 
+import math
 import re
 import sys
 import time
@@ -662,7 +663,7 @@ with right_col:
 
         st.markdown('<div class="s-hdr">Quote Builder</div>', unsafe_allow_html=True)
 
-        from pipeline.betting import QuoteParams, taker_fee_per_share, kelly_fraction
+        from pipeline.betting import taker_fee_per_share, kelly_fraction
         from scripts.predict_match import series_win_prob
 
         qb1, qb2, qb3 = st.columns([2, 1, 1])
@@ -681,7 +682,6 @@ with right_col:
 
         # Symmetric maker quotes: always fair ± half_spread, no skew.
         # The directional signal (Kelly bet) is shown separately.
-        import math
         TICK = 0.01
         q_bid = max(0.01, round(math.floor((p_fair - half_spread) / TICK) * TICK, 4))
         q_ask = min(0.99, round(math.ceil( (p_fair + half_spread) / TICK) * TICK, 4))
