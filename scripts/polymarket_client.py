@@ -25,8 +25,26 @@ from dotenv import load_dotenv
 load_dotenv(ROOT / ".env")
 
 from py_clob_client.client import ClobClient
-from py_clob_client.clob_types import OrderArgs, OrderType
+from py_clob_client.clob_types import OrderArgs, PartialCreateOrderOptions
 from py_clob_client.order_builder.constants import BUY, SELL
+
+
+def _order_options(condition_id: str) -> PartialCreateOrderOptions:
+    """
+    Fetch tick_size and neg_risk for a market from the CLOB.
+    Both are baked into the EIP-712 order hash — if either is wrong
+    the server's recomputed hash won't match and you get 'invalid signature'.
+    """
+    client = get_client()
+    try:
+        market = client.get_market(condition_id)
+        tick         = str(market.get("minTickSize") or market.get("minimum_tick_size") or "0.01")
+        neg_risk_raw = market.get("negRisk") or market.get("neg_risk")
+        # Explicit check: don't use bool() — bool("false") == True in Python
+        neg_risk     = neg_risk_raw is True or str(neg_risk_raw).lower() == "true"
+    except Exception:
+        tick, neg_risk = "0.01", False
+    return PartialCreateOrderOptions(tick_size=tick, neg_risk=neg_risk)
 
 
 # ─── Client setup ─────────────────────────────────────────────────────────────
@@ -46,11 +64,18 @@ def get_client() -> ClobClient:
     if not private_key or not funder:
         raise EnvironmentError("POLY_PRIVATE_KEY and POLY_FUNDER must be set in .env")
 
+    # signature_type controls how orders are signed:
+    #   0 = EOA      — your private key IS your wallet (rare for Polymarket users)
+    #   1 = Magic    — Magic.link / email login
+    #   2 = Proxy    — Google login / most Polymarket accounts (most common)
+    # Set POLY_SIGNATURE_TYPE in .env to override. Defaults to 2.
+    sig_type = int(os.getenv("POLY_SIGNATURE_TYPE", "2"))
+
     client = ClobClient(
         host="https://clob.polymarket.com",
         chain_id=137,
         key=private_key,
-        signature_type=0,   # EOA — standard for Google/Magic login keys
+        signature_type=sig_type,
         funder=funder,
     )
 
@@ -401,6 +426,65 @@ def get_orderbook_snapshot(token_id: str, depth: int = 5) -> dict:
     return {"bids": bids, "asks": asks, "mid": mid}
 
 
+def get_price_history(token_id: str, interval: str = "1w", fidelity: int = 100) -> list[dict]:
+    """
+    Fetch OHLC price history for a token from the CLOB.
+
+    Parameters
+    ----------
+    token_id : YES token id
+    interval : time window — "1d", "1w", "1m", "all"
+    fidelity : number of data points (max ~100 for web display)
+
+    Returns
+    -------
+    List of dicts with keys: t (unix timestamp), p (price 0–1)
+    """
+    client = get_client()
+    try:
+        history = client.get_prices_history(
+            token_id=token_id,
+            interval=interval,
+            fidelity=fidelity,
+        )
+        # py_clob_client returns list of PricePoint objects or dicts
+        result = []
+        for pt in (history or []):
+            if hasattr(pt, "t"):
+                result.append({"t": pt.t, "p": float(pt.p)})
+            elif isinstance(pt, dict):
+                result.append({"t": pt.get("t") or pt.get("timestamp"), "p": float(pt.get("p") or pt.get("price", 0))})
+        return result
+    except Exception:
+        return []
+
+
+def get_market_volume(condition_id: str) -> dict:
+    """
+    Fetch total volume and liquidity for a market from the Gamma API.
+
+    Returns dict with keys: volume (total USDC traded), liquidity (current)
+    """
+    try:
+        resp = requests.get(
+            f"https://gamma-api.polymarket.com/markets",
+            params={"conditionId": condition_id},
+            timeout=8,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        markets = data if isinstance(data, list) else data.get("markets", [])
+        if markets:
+            m = markets[0]
+            return {
+                "volume":    float(m.get("volume")    or m.get("volumeNum")    or 0),
+                "liquidity": float(m.get("liquidity") or m.get("liquidityNum") or 0),
+            }
+    except Exception:
+        pass
+    return {"volume": 0.0, "liquidity": 0.0}
+
+
 # ─── Order posting ────────────────────────────────────────────────────────────
 
 @dataclass
@@ -414,69 +498,107 @@ class PostedQuote:
 
 
 def post_two_sided_quote(
-    token_id:  str,
-    bid_price: float,
-    ask_price: float,
-    size:      float,
-    dry_run:   bool = False,
+    token_id:     str,
+    no_token_id:  str,
+    condition_id: str,
+    t1_price:     float,
+    t2_price:     float,
+    size:         float,
+    dry_run:      bool = False,
 ) -> PostedQuote:
     """
-    Post a bid and ask for the YES token.
+    Post two standing BUY orders — one for team1's token, one for team2's token.
+
+    Prices must already be clamped by the caller to sit below the current
+    market ask for each token (so orders rest as makers, not cross as takers).
 
     Parameters
     ----------
-    token_id  : YES token id from LoLMarket
-    bid_price : price to BUY YES (e.g. 0.47)
-    ask_price : price to SELL YES (e.g. 0.53)
-    size      : number of shares for each side
-    dry_run   : if True, print orders but don't submit
-
-    Returns
-    -------
-    PostedQuote with order IDs
+    token_id     : YES token id (team1) from LoLMarket
+    no_token_id  : NO token id  (team2) from LoLMarket
+    condition_id : market condition_id (needed for EIP-712 order hash)
+    t1_price     : price to BUY team1 token — must be < current YES ask
+    t2_price     : price to BUY team2 token — must be < current NO ask (= 1 − YES bid)
+    size         : number of shares for each side
+    dry_run      : if True, print orders but don't submit
     """
-    if bid_price >= ask_price:
+    if t1_price + t2_price >= 1.0:
         raise ValueError(
-            f"Crossed market: bid={bid_price} >= ask={ask_price}. "
-            "This would cause an immediate loss on every fill."
+            f"Crossed market: team1={t1_price} + team2={t2_price} >= 1.00. "
+            "No guaranteed profit if both fill."
         )
 
     client = get_client()
+    opts   = _order_options(condition_id)
 
     bid_id = None
     ask_id = None
 
     if dry_run:
-        print(f"[DRY RUN] Would post BID  {size:.0f} shares @ {bid_price:.3f}")
-        print(f"[DRY RUN] Would post ASK  {size:.0f} shares @ {ask_price:.3f}")
+        print(f"[DRY RUN] Would BUY team1 (YES) {size:.0f} shares @ {t1_price:.3f}")
+        print(f"[DRY RUN] Would BUY team2 (NO)  {size:.0f} shares @ {t2_price:.3f}")
     else:
-        # Post bid (buy YES)
+        # Buy team1 token (YES)
         bid_order = client.create_and_post_order(
-            OrderArgs(token_id=token_id, side=BUY,  price=bid_price, size=size),
-            order_type=OrderType.GTC,
+            OrderArgs(token_id=token_id, side=BUY, price=t1_price, size=size),
+            opts,
         )
         bid_id = bid_order.get("orderID") if bid_order else None
 
-        time.sleep(0.3)   # brief pause between orders
+        time.sleep(0.3)
 
-        # Post ask (sell YES)
+        # Buy team2 token (NO)
         ask_order = client.create_and_post_order(
-            OrderArgs(token_id=token_id, side=SELL, price=ask_price, size=size),
-            order_type=OrderType.GTC,
+            OrderArgs(token_id=no_token_id, side=BUY, price=t2_price, size=size),
+            opts,
         )
         ask_id = ask_order.get("orderID") if ask_order else None
 
-        print(f"Posted BID  {size:.0f} @ {bid_price:.3f}  [id: {str(bid_id)[:8]}...]")
-        print(f"Posted ASK  {size:.0f} @ {ask_price:.3f}  [id: {str(ask_id)[:8]}...]")
+        print(f"Posted BUY team1 (YES) {size:.0f} @ {t1_price:.3f}  [id: {str(bid_id)[:8]}...]")
+        print(f"Posted BUY team2 (NO)  {size:.0f} @ {t2_price:.3f}  [id: {str(ask_id)[:8]}...]")
 
     return PostedQuote(
         bid_order_id=bid_id,
         ask_order_id=ask_id,
-        bid_price=bid_price,
-        ask_price=ask_price,
+        bid_price=t1_price,
+        ask_price=t2_price,
         size=size,
         token_id=token_id,
     )
+
+
+def post_directional_order(
+    token_id:     str,
+    condition_id: str,
+    price:        float,
+    size:         float,
+    dry_run:      bool = False,
+) -> str | None:
+    """
+    Post a single taker BUY order for the given token (YES or NO).
+
+    To buy YES: pass yes_token_id and the current YES ask price.
+    To buy NO:  pass no_token_id  and the current NO  ask price (= 1 − yes_bid).
+
+    Posts at `price + 1 tick` to ensure the order crosses as a taker.
+    Returns the order ID, or None on dry run.
+    """
+    TICK = 0.01
+    taker_price = round(min(price + TICK, 0.99), 2)
+
+    client = get_client()
+
+    if dry_run:
+        print(f"[DRY RUN] Would BUY  {size:.0f} shares @ {taker_price:.2f}")
+        return None
+
+    order = client.create_and_post_order(
+        OrderArgs(token_id=token_id, side=BUY, price=taker_price, size=size),
+        _order_options(condition_id),
+    )
+    order_id = order.get("orderID") if order else None
+    print(f"Directional BUY  {size:.0f} @ {taker_price:.2f}  [id: {str(order_id)[:8]}...]")
+    return order_id
 
 
 # ─── Order management ─────────────────────────────────────────────────────────

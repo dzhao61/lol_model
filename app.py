@@ -91,11 +91,6 @@ section[data-testid="stSidebar"] { display: none; }
 .q-sub   { font-size:11px; color:#718096; margin-top:2px; }
 .q-divider { border-left:1px solid #2d3748; margin:0 8px; }
 
-/* Direction badge */
-.dir-yes  { background:#1c4532; color:#48bb78; padding:3px 12px; border-radius:4px; font-weight:700; font-size:13px; display:inline-block; }
-.dir-no   { background:#1a365d; color:#63b3ed; padding:3px 12px; border-radius:4px; font-weight:700; font-size:13px; display:inline-block; }
-.dir-pass { background:#2d3748; color:#718096; padding:3px 12px; border-radius:4px; font-weight:600; font-size:13px; display:inline-block; }
-
 /* Freshness */
 .ts-fresh { color:#48bb78; font-size:11px; }
 .ts-stale { color:#d69e2e; font-size:11px; }
@@ -103,6 +98,16 @@ section[data-testid="stSidebar"] { display: none; }
 
 /* Warn box */
 .warn-box { border-left:3px solid #d69e2e; padding:4px 10px; font-size:12px; color:#d69e2e; margin:4px 0; }
+
+/* Strategy panels */
+.panel-mm  { border:1px solid #2d3748; border-radius:8px; padding:14px 16px; background:#0f1117; margin:6px 0; }
+.panel-title { font-size:10px; font-weight:700; letter-spacing:0.12em; text-transform:uppercase; margin-bottom:10px; color:#718096; }
+.panel-row { display:flex; align-items:center; gap:20px; flex-wrap:wrap; }
+.panel-stat .lbl { font-size:10px; color:#718096; text-transform:uppercase; letter-spacing:0.08em; }
+.panel-stat .val { font-size:22px; font-weight:700; line-height:1.2; }
+.panel-stat .sub { font-size:11px; color:#718096; }
+.panel-meta { font-size:12px; line-height:2; }
+.panel-caption { font-size:11px; color:#4a5568; margin-top:8px; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -229,11 +234,28 @@ def load_markets(league: str = ""):
 
 
 @st.cache_data(ttl=60, show_spinner=False)
-def fetch_prices(yes_token_id: str):
+def fetch_orderbook(token_id: str):
     from scripts.polymarket_client import get_orderbook_snapshot
     ts = time.time()
-    snap = get_orderbook_snapshot(yes_token_id)
+    snap = get_orderbook_snapshot(token_id)
     return snap, ts
+
+
+# Keep old name as alias so nothing else breaks
+def fetch_prices(yes_token_id: str):
+    return fetch_orderbook(yes_token_id)
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def fetch_price_history(yes_token_id: str):
+    from scripts.polymarket_client import get_price_history
+    return get_price_history(yes_token_id, interval="1w", fidelity=100)
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def fetch_market_volume(condition_id: str):
+    from scripts.polymarket_client import get_market_volume
+    return get_market_volume(condition_id)
 
 
 @st.cache_data(show_spinner=False)
@@ -353,7 +375,7 @@ with left_col:
     # Auto-fetch (cached 60s); manual refresh with button
     price_refresh = st.button("↻ Refresh prices", key="price_refresh", use_container_width=False)
     if price_refresh:
-        fetch_prices.clear()
+        fetch_orderbook.clear()
 
     try:
         snap, fetched_at = fetch_prices(sel_market.yes_token_id)
@@ -418,6 +440,118 @@ with left_col:
             f"Manual mid — P({poly_t1})", 0.01, 0.99, 0.50, 0.01, "%.2f",
             key="manual_mid",
         )
+
+    # ── Orderbook depth ──────────────────────────────────────────────────────
+
+    # Fetch NO token orderbook independently — it's a separate book with its own liquidity
+    try:
+        snap_no, _ = fetch_orderbook(sel_market.no_token_id)
+    except Exception:
+        snap_no = None
+
+    if snap and (snap.get("bids") or snap.get("asks")):
+        yes_bids = snap.get("bids", [])
+        yes_asks = snap.get("asks", [])
+        yes_spread = round((yes_asks[0][0] - yes_bids[0][0]) * 100, 1) if yes_bids and yes_asks else None
+
+        if snap_no and (snap_no.get("bids") or snap_no.get("asks")):
+            no_bids   = snap_no.get("bids", [])
+            no_asks   = snap_no.get("asks", [])
+            no_mid_ob = snap_no.get("mid")
+            no_spread = round((no_asks[0][0] - no_bids[0][0]) * 100, 1) if no_bids and no_asks else None
+        else:
+            no_bids = no_asks = []
+            no_mid_ob = no_mid
+            no_spread = None
+
+        def _book_html(bids, asks, mid_val, spread_val, depth=5):
+            rows = ""
+            for p, s in reversed(asks[:depth]):
+                rows += (
+                    f"<tr>"
+                    f"<td style='color:#fc8181;text-align:right;padding:1px 6px'>{p*100:.1f}¢</td>"
+                    f"<td style='color:#4a5568;text-align:right;padding:1px 6px'>{s:.0f}</td>"
+                    f"<td style='padding:1px 6px'></td>"
+                    f"</tr>"
+                )
+            mid_str    = f"{mid_val*100:.1f}¢" if mid_val else "—"
+            spread_str = f"sprd {spread_val:.1f}¢" if spread_val else ""
+            rows += (
+                f"<tr style='background:#2d3748'>"
+                f"<td colspan='3' style='text-align:center;font-size:10px;"
+                f"color:#a0aec0;padding:2px 6px'>{mid_str}  {spread_str}</td>"
+                f"</tr>"
+            )
+            for p, s in bids[:depth]:
+                rows += (
+                    f"<tr>"
+                    f"<td style='padding:1px 6px'></td>"
+                    f"<td style='color:#4a5568;text-align:right;padding:1px 6px'>{s:.0f}</td>"
+                    f"<td style='color:#48bb78;padding:1px 6px'>{p*100:.1f}¢</td>"
+                    f"</tr>"
+                )
+            return (
+                f'<table style="width:100%;border-collapse:collapse;font-size:11px">'
+                f'<thead><tr>'
+                f'<th style="color:#fc8181;text-align:right;padding:2px 6px;font-weight:600">Ask</th>'
+                f'<th style="color:#4a5568;text-align:right;padding:2px 6px;font-weight:600">Qty</th>'
+                f'<th style="color:#48bb78;padding:2px 6px;font-weight:600">Bid</th>'
+                f'</tr></thead>'
+                f'<tbody>{rows}</tbody>'
+                f'</table>'
+            )
+
+        ob1_html = _book_html(yes_bids, yes_asks, yes_mid,    yes_spread)
+        ob2_html = _book_html(no_bids,  no_asks,  no_mid_ob, no_spread)
+
+        ob_col1, ob_col2 = st.columns(2)
+        with ob_col1:
+            st.markdown(
+                f'<div class="lbl" style="margin:10px 0 4px">{poly_t1} token</div>'
+                + ob1_html,
+                unsafe_allow_html=True,
+            )
+        with ob_col2:
+            st.markdown(
+                f'<div class="lbl" style="margin:10px 0 4px">{poly_t2} token</div>'
+                + ob2_html,
+                unsafe_allow_html=True,
+            )
+
+    # ── Volume & liquidity ───────────────────────────────────────────────────
+
+    try:
+        vol_data = fetch_market_volume(sel_market.condition_id)
+        if vol_data["volume"] > 0 or vol_data["liquidity"] > 0:
+            st.markdown(
+                f'<div style="display:flex;gap:16px;margin:8px 0 4px;font-size:11px">'
+                f'<div><span style="color:#718096">Total volume</span>  '
+                f'<b>${vol_data["volume"]:,.0f}</b></div>'
+                f'<div><span style="color:#718096">Liquidity</span>  '
+                f'<b>${vol_data["liquidity"]:,.0f}</b></div>'
+                f'</div>',
+                unsafe_allow_html=True,
+            )
+    except Exception:
+        pass
+
+    # ── Price history ────────────────────────────────────────────────────────
+
+    try:
+        import pandas as pd
+        history = fetch_price_history(sel_market.yes_token_id)
+        if len(history) >= 3:
+            df_hist = pd.DataFrame(history)
+            df_hist["t"] = pd.to_datetime(df_hist["t"], unit="s", utc=True)
+            df_hist = df_hist.rename(columns={"t": "time", "p": poly_t1})
+            df_hist = df_hist.set_index("time")
+            st.markdown(
+                '<div class="lbl" style="margin:8px 0 2px">Price history (7d)</div>',
+                unsafe_allow_html=True,
+            )
+            st.line_chart(df_hist, height=120, use_container_width=True)
+    except Exception:
+        pass
 
     # ── Team stats ───────────────────────────────────────────────────────────
 
@@ -486,11 +620,9 @@ with left_col:
 
     s1, s2 = st.columns(2)
     with s1:
-        bankroll    = st.number_input("Bankroll (USDC)", 10.0, value=200.0, step=10.0)
         half_spread = st.number_input("Half-spread (¢)", 1, value=3, step=1) / 100
     with s2:
-        quote_size  = st.number_input("Shares / side", 1, value=100, step=10)
-        min_edge    = st.number_input("Min edge (%)", 1, value=2, step=1) / 100
+        quote_size  = st.number_input("Shares / side", 5, value=100, step=5)
 
     # Team name overrides (collapsed)
     # Keys are scoped to condition_id so stale widget state never bleeds across markets.
@@ -566,7 +698,9 @@ with right_col:
     if model_results:
         from scripts.predict_match import series_win_prob
 
-        def _edge_class(v: float, threshold: float) -> str:
+        _EDGE_THRESHOLD = 0.02  # 2¢ — highlight edges above this in the signals table
+
+        def _edge_class(v: float, threshold: float = _EDGE_THRESHOLD) -> str:
             if v >= threshold:  return "pos"
             if v > 0:           return "neu"
             return "neg"
@@ -613,8 +747,8 @@ with right_col:
                     f"<td colspan='4' style='color:#fc8181;font-size:11px'>{rd['error']}</td></tr>"
                 )
                 continue
-            ey_cls = _edge_class(rd["edge_yes"], min_edge)
-            en_cls = _edge_class(rd["edge_no"],  min_edge)
+            ey_cls = _edge_class(rd["edge_yes"])
+            en_cls = _edge_class(rd["edge_no"])
             body_rows += (
                 f"<tr>"
                 f"<td>{rd['label']}</td>"
@@ -630,9 +764,9 @@ with right_col:
             p_avg     = sum(p_series_list) / len(p_series_list)
             avg_ey    = p_avg - p_market_yes
             avg_en    = (1.0 - p_avg) - (1.0 - p_market_yes)
-            ey_cls    = _edge_class(avg_ey, min_edge)
-            en_cls    = _edge_class(avg_en, min_edge)
-            n_pos_yes = sum(1 for rd in rows_data if "error" not in rd and rd["edge_yes"] >= min_edge)
+            ey_cls    = _edge_class(avg_ey)
+            en_cls    = _edge_class(avg_en)
+            n_pos_yes = sum(1 for rd in rows_data if "error" not in rd and rd["edge_yes"] >= _EDGE_THRESHOLD)
             n_tot     = sum(1 for rd in rows_data if "error" not in rd)
             body_rows += (
                 f"<tr class='consensus'>"
@@ -663,7 +797,7 @@ with right_col:
 
         st.markdown('<div class="s-hdr">Quote Builder</div>', unsafe_allow_html=True)
 
-        from pipeline.betting import taker_fee_per_share, kelly_fraction
+        from pipeline.betting import taker_fee_per_share
         from scripts.predict_match import series_win_prob
 
         qb1, qb2, qb3 = st.columns([2, 1, 1])
@@ -671,142 +805,195 @@ with right_col:
             valid_models = [lbl for lbl, r in model_results.items() if "error" not in r]
             model_choice = st.selectbox("Model", valid_models, key="model_choice")
         with qb2:
-            prob_choice  = st.radio("Prob", ["Series", "Per-game"], horizontal=True, key="prob_choice")
+            prob_choice = st.radio("Prob", ["Series", "Per-game"], horizontal=True, key="prob_choice")
         with qb3:
-            kelly_frac   = st.number_input("Kelly frac", 0.05, 1.0, 0.25, 0.05, key="kelly_frac")
+            kelly_frac = st.number_input("Kelly frac", 0.05, 1.0, 0.25, 0.05, key="kelly_frac")
 
         r_chosen = model_results[model_choice]
         p_game   = r_chosen["p_model"]
         p_ser    = series_win_prob(p_game, series_fmt) if series_fmt in ("Bo3", "Bo5") else p_game
         p_fair   = p_ser if prob_choice == "Series" else p_game
 
-        # Symmetric maker quotes: always fair ± half_spread, no skew.
-        # The directional signal (Kelly bet) is shown separately.
-        TICK = 0.01
-        q_bid = max(0.01, round(math.floor((p_fair - half_spread) / TICK) * TICK, 4))
-        q_ask = min(0.99, round(math.ceil( (p_fair + half_spread) / TICK) * TICK, 4))
-
+        TICK     = 0.01
         fee      = taker_fee_per_share(p_market_yes)
-        edge_yes = p_fair - p_market_yes
-        net_edge = abs(edge_yes) - fee
 
-        # Kelly directional sizing
-        k_size = kelly_fraction(p_fair, p_market_yes, kelly_frac, as_maker=False)
-        k_size = min(k_size, 0.10)
-        stake  = bankroll * k_size
+        # Raw model-based quotes centered on p_fair
+        q_bid_raw = max(0.01, round(math.floor((p_fair - half_spread) / TICK) * TICK, 4))
+        q_ask_raw = min(0.99, round(math.ceil( (p_fair + half_spread) / TICK) * TICK, 4))
 
-        if abs(edge_yes) >= min_edge:
-            if edge_yes > 0:
-                dir_html = '<span class="dir-yes">▲ BUY YES</span>'
-            else:
-                dir_html = '<span class="dir-no">▼ BUY NO</span>'
+        # Clamp to never cross the current market — ensures orders REST as makers.
+        # Rule: our BUY price must be strictly below the current best ASK.
+        #   team1 ask = yes_ask
+        #   team2 ask = 1 − yes_bid  (NO token's ask = complement of YES token's bid)
+        # If market data is unavailable we fall back to the raw model price.
+        if yes_ask is not None:
+            t1_token_price = min(q_bid_raw, round(yes_ask - TICK, 2))
         else:
-            dir_html = '<span class="dir-pass">— PASS / MM only</span>'
+            t1_token_price = q_bid_raw
 
-        stake_html = (
-            f'<b>${stake:.2f}</b> &nbsp;({k_size:.3f} Kelly)'
-            if k_size > 0 else "—"
-        )
+        no_ask_mkt = round(1.0 - yes_bid, 2) if yes_bid is not None else None
+        no_price_raw = round(1.0 - q_ask_raw, 2)
+        if no_ask_mkt is not None:
+            t2_token_price = min(no_price_raw, round(no_ask_mkt - TICK, 2))
+        else:
+            t2_token_price = no_price_raw
+
+        # Enforce minimum prices and recalculate summary stats
+        t1_token_price = max(0.01, t1_token_price)
+        t2_token_price = max(0.01, t2_token_price)
+        combined_cost  = round(t1_token_price + t2_token_price, 2)
+        mm_profit      = round(1.0 - combined_cost, 2)
+
+        n = int(quote_size)
+
+        # ── Per-order dollar amounts ──────────────────────────────────────────
+        t1_cost      = round(t1_token_price * n, 2)
+        t2_cost      = round(t2_token_price * n, 2)
+        t1_win       = round((1.0 - t1_token_price) * n, 2)   # profit if only t1 fills and wins
+        t1_loss      = round(t1_token_price * n, 2)            # loss if only t1 fills and loses
+        t2_win       = round((1.0 - t2_token_price) * n, 2)   # profit if only t2 fills and wins
+        t2_loss      = round(t2_token_price * n, 2)            # loss if only t2 fills and loses
+
+        # ── Both-fill scenario ────────────────────────────────────────────────
+        total_cost     = round(combined_cost * n, 2)
+        both_profit    = round(mm_profit * n, 2)               # guaranteed profit (one must win)
+        rebate_total   = round(fee * 0.25 * n * 2, 4)         # rebate on both sides when taken
+        roi_pct        = round(mm_profit / combined_cost * 100, 1) if combined_cost > 0 else 0
+
+        # clamping indicator: show warning if either price was clamped by market
+        t1_clamped = yes_ask is not None and q_bid_raw > round(yes_ask - TICK, 2)
+        t2_clamped = yes_bid is not None and no_price_raw > round(1.0 - yes_bid - TICK, 2)
+
+        # ── Section 1: Market Making ──────────────────────────────────────────
+
+        clamp_note = ""
+        if t1_clamped or t2_clamped:
+            clamped_sides = []
+            if t1_clamped: clamped_sides.append(poly_t1)
+            if t2_clamped: clamped_sides.append(poly_t2)
+            clamp_note = (
+                f'<div class="warn-box">⚠ {" and ".join(clamped_sides)} price clamped below market ask '
+                f'— model bid was above ask, order would have crossed as taker. Price adjusted to rest in book.</div>'
+            )
 
         st.markdown(
-            f'<div class="q-card">'
-            f'<div style="display:flex; gap:0; align-items:stretch;">'
+            f'<div class="panel-mm">'
+            f'<div class="panel-title">📈 Market Making — standing buy orders on both sides</div>'
 
-            f'<div class="q-side" style="flex:1">'
-            f'<div class="q-lbl">BID (buy YES)</div>'
-            f'<div class="q-price">{q_bid:.2f}</div>'
-            f'<div class="q-sub">{q_bid*100:.0f}¢</div>'
+            # ── Order row ────────────────────────────────────────────────────
+            f'<div style="display:flex;gap:12px;margin-bottom:12px;flex-wrap:wrap">'
+
+            f'<div style="flex:1;min-width:160px;background:#1a202c;border-radius:6px;padding:10px 14px">'
+            f'<div class="lbl" style="margin-bottom:4px">Buy {poly_t1} token</div>'
+            f'<div style="font-size:22px;font-weight:700">{t1_token_price*100:.0f}¢ / share</div>'
+            f'<div style="font-size:11px;color:#718096;margin-top:4px">'
+            f'{n} shares  ·  <b style="color:#e2e8f0">${t1_cost:.2f} total cost</b></div>'
+            f'<div style="font-size:11px;margin-top:6px;display:flex;gap:12px">'
+            f'<span style="color:#48bb78">▲ +${t1_win:.2f} if {poly_t1} wins</span>'
+            f'<span style="color:#fc8181">▼ −${t1_loss:.2f} if {poly_t1} loses</span>'
+            f'</div>'
             f'</div>'
 
-            f'<div class="q-divider"></div>'
+            f'<div style="align-self:center;font-size:18px;color:#4a5568">+</div>'
 
-            f'<div class="q-side" style="flex:1">'
-            f'<div class="q-lbl">ASK (sell YES)</div>'
-            f'<div class="q-price">{q_ask:.2f}</div>'
-            f'<div class="q-sub">{q_ask*100:.0f}¢</div>'
+            f'<div style="flex:1;min-width:160px;background:#1a202c;border-radius:6px;padding:10px 14px">'
+            f'<div class="lbl" style="margin-bottom:4px">Buy {poly_t2} token</div>'
+            f'<div style="font-size:22px;font-weight:700">{t2_token_price*100:.0f}¢ / share</div>'
+            f'<div style="font-size:11px;color:#718096;margin-top:4px">'
+            f'{n} shares  ·  <b style="color:#e2e8f0">${t2_cost:.2f} total cost</b></div>'
+            f'<div style="font-size:11px;margin-top:6px;display:flex;gap:12px">'
+            f'<span style="color:#48bb78">▲ +${t2_win:.2f} if {poly_t2} wins</span>'
+            f'<span style="color:#fc8181">▼ −${t2_loss:.2f} if {poly_t2} loses</span>'
+            f'</div>'
             f'</div>'
 
-            f'<div class="q-divider"></div>'
+            f'<div style="align-self:center;font-size:18px;color:#4a5568">=</div>'
 
-            f'<div style="flex:1.4; padding:4px 12px; font-size:12px; line-height:1.9">'
-            f'<div><span style="color:#718096">Fair value</span>  <b>{p_fair:.3f}</b></div>'
-            f'<div><span style="color:#718096">Spread</span>  <b>{(q_ask-q_bid)*100:.0f}¢</b></div>'
-            f'<div><span style="color:#718096">Edge YES</span>  <b>{edge_yes:+.3f}</b></div>'
-            f'<div><span style="color:#718096">Net (−fee)</span>  '
-            f'<b style="color:{"#48bb78" if net_edge>0 else "#fc8181"}">{net_edge:+.4f}</b></div>'
+            # ── Both-fill outcome ────────────────────────────────────────────
+            f'<div style="flex:1;min-width:160px;background:#1a2e1a;border:1px solid #276749;border-radius:6px;padding:10px 14px">'
+            f'<div class="lbl" style="color:#68d391;margin-bottom:4px">If both fill</div>'
+            f'<div style="font-size:22px;font-weight:700;color:#48bb78">+${both_profit:.2f}</div>'
+            f'<div style="font-size:11px;color:#718096;margin-top:4px">'
+            f'guaranteed — one token always pays $1</div>'
+            f'<div style="font-size:11px;margin-top:6px;color:#68d391">'
+            f'Spent ${total_cost:.2f}  ·  ROI {roi_pct:.1f}%</div>'
             f'</div>'
 
-            f'<div class="q-divider"></div>'
+            f'</div>'  # end order row
 
-            f'<div style="flex:1.3; padding:4px 12px; font-size:12px; line-height:1.9; display:flex; flex-direction:column; justify-content:center; gap:6px">'
-            f'<div>{dir_html}</div>'
-            f'<div style="color:#718096">Stake: {stake_html}</div>'
-            f'<div style="color:#718096;font-size:10px">fee {fee:.4f}</div>'
+            # ── Summary stats row ────────────────────────────────────────────
+            f'<div style="display:flex;gap:24px;padding:8px 2px;border-top:1px solid #2d3748;flex-wrap:wrap">'
+            f'<div><span style="color:#718096;font-size:11px">Model fair value</span>  '
+            f'<b style="font-size:12px">{p_fair*100:.0f}¢</b></div>'
+            f'<div><span style="color:#718096;font-size:11px">Market mid</span>  '
+            f'<b style="font-size:12px">{(p_market_yes or 0)*100:.0f}¢</b></div>'
+            f'<div><span style="color:#718096;font-size:11px">USDC reserved</span>  '
+            f'<b style="font-size:12px">${total_cost:.2f}</b></div>'
+            f'<div><span style="color:#718096;font-size:11px">Maker rebate (est.)</span>  '
+            f'<b style="font-size:12px">+${rebate_total:.3f}</b></div>'
+            f'<div><span style="color:#718096;font-size:11px">Worst case</span>  '
+            f'<b style="font-size:12px;color:#fc8181">−${max(t1_loss, t2_loss):.2f}</b>'
+            f'<span style="color:#4a5568;font-size:11px"> (one side fills, team loses)</span></div>'
             f'</div>'
 
-            f'</div>'
+            f'{clamp_note}'
             f'</div>',
             unsafe_allow_html=True,
         )
 
-        st.markdown("<br>", unsafe_allow_html=True)
-
-        # ── Execute ───────────────────────────────────────────────────────────
-
-        st.markdown('<div class="s-hdr">Execute</div>', unsafe_allow_html=True)
-
-        ex1, ex2 = st.columns(2)
-
-        with ex1:
-            post_label = f"🚀  Post  {q_bid:.2f} / {q_ask:.2f}  ×{int(quote_size)}"
-            if st.button(post_label, type="primary", use_container_width=True):
+        mm1, mm2 = st.columns([3, 1])
+        with mm1:
+            if st.button(
+                f"🚀  Post: Buy {poly_t1} @ {t1_token_price*100:.0f}¢  +  Buy {poly_t2} @ {t2_token_price*100:.0f}¢  ×{int(quote_size)}",
+                type="primary", use_container_width=True, key="post_mm",
+            ):
                 with st.spinner("Submitting orders..."):
                     try:
                         from scripts.polymarket_client import post_two_sided_quote
                         posted = post_two_sided_quote(
                             token_id=sel_market.yes_token_id,
-                            bid_price=q_bid,
-                            ask_price=q_ask,
-                            size=float(quote_size),
-                            dry_run=False,
+                            no_token_id=sel_market.no_token_id,
+                            condition_id=sel_market.condition_id,
+                            t1_price=t1_token_price,
+                            t2_price=t2_token_price,
+                            size=float(quote_size), dry_run=False,
                         )
-                        st.session_state["last_order"] = {
+                        st.session_state["last_mm_order"] = {
                             "bid_id": posted.bid_order_id,
                             "ask_id": posted.ask_order_id,
-                            "bid":    q_bid,
-                            "ask":    q_ask,
-                            "cid":    sel_market.condition_id,
-                            "ts":     time.time(),
+                            "t1_price": t1_token_price, "t2_price": t2_token_price,
+                            "cid": sel_market.condition_id, "ts": time.time(),
                         }
+                        bid_str = posted.bid_order_id[:12] if posted.bid_order_id else "unknown"
+                        ask_str = posted.ask_order_id[:12] if posted.ask_order_id else "unknown"
                         st.success(
-                            f"Orders posted  ·  Bid `{posted.bid_order_id[:12]}…`"
-                            f"  Ask `{posted.ask_order_id[:12]}…`"
+                            f"Orders placed  ·  {poly_t1} `{bid_str}…`"
+                            f"  ·  {poly_t2} `{ask_str}…`"
                         )
                     except Exception as e:
                         st.error(f"Post failed: {e}")
-
-        with ex2:
-            if st.button("❌  Cancel all orders", use_container_width=True):
+        with mm2:
+            if st.button("❌  Cancel all", use_container_width=True, key="cancel_mm"):
                 with st.spinner("Cancelling..."):
                     try:
                         from scripts.polymarket_client import cancel_all_orders
                         cancel_all_orders(sel_market.condition_id)
                         st.success("All orders cancelled.")
-                        st.session_state.pop("last_order", None)
+                        st.session_state.pop("last_mm_order", None)
                     except Exception as e:
                         st.error(f"Cancel failed: {e}")
 
-        # Last order status strip
-        lo = st.session_state.get("last_order")
+        lo = st.session_state.get("last_mm_order")
         if lo and lo.get("cid") == sel_market.condition_id:
             age_s = int(time.time() - lo["ts"])
             st.markdown(
-                f'<div style="font-size:11px; color:#718096; margin-top:6px; padding:6px 10px; '
-                f'border:1px solid #2d3748; border-radius:4px;">'
-                f'Last posted  ·  BID <b>{lo["bid"]:.3f}</b>  ASK <b>{lo["ask"]:.3f}</b>'
+                f'<div style="font-size:11px;color:#718096;margin-top:4px;padding:5px 10px;'
+                f'border:1px solid #2d3748;border-radius:4px;">'
+                f'Active  ·  {poly_t1} @ <b>{lo["t1_price"]*100:.0f}¢</b>'
+                f'  ·  {poly_t2} @ <b>{lo["t2_price"]*100:.0f}¢</b>'
                 f'  ·  <span style="color:#f6ad55">{age_s}s ago</span>'
-                f'  ·  Bid <code>{lo["bid_id"][:12]}…</code>'
-                f'  ·  Ask <code>{lo["ask_id"][:12]}…</code>'
+                f'  ·  <code>{lo["bid_id"][:10]}…</code> / <code>{lo["ask_id"][:10]}…</code>'
                 f'</div>',
                 unsafe_allow_html=True,
             )
+

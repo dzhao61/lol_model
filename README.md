@@ -21,8 +21,9 @@ pip install -r requirements.txt
 
 **2. Create `.env`**
 ```
-POLY_PRIVATE_KEY=0x...
-POLY_FUNDER=0x...
+POLY_PRIVATE_KEY=0x...   # your exported private key
+POLY_FUNDER=0x...        # your wallet address shown on polymarket.com/profile
+POLY_SIGNATURE_TYPE=1    # 0=EOA, 1=Magic (email login), 2=Proxy (Google login)
 ```
 
 **3. Ensure the model cache exists**

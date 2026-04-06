@@ -26,15 +26,14 @@ def main():
         print("ERROR: POLY_PRIVATE_KEY or POLY_FUNDER missing from .env")
         sys.exit(1)
 
-    print("Connecting to Polymarket CLOB...")
+    sig_type = int(os.getenv("POLY_SIGNATURE_TYPE", "2"))
+    print(f"Connecting to Polymarket CLOB (signature_type={sig_type})...")
 
-    # Signature type 0 = standard EOA (works for Magic/Google login private keys)
-    # Try type 1 (POLY_PROXY) if this fails
     client = ClobClient(
         host="https://clob.polymarket.com",
         chain_id=137,
         key=private_key,
-        signature_type=0,
+        signature_type=sig_type,
         funder=funder,
     )
 

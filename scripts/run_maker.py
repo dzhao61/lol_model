@@ -99,11 +99,17 @@ def run(args):
     p_market = None
     market   = None
 
+    yes_ask_live = None  # track current ask for clamping
+
     if args.condition_id:
         print("Step 2 — Fetching Polymarket price...")
         market = get_market_by_condition_id(args.condition_id)
         if market:
-            p_market = get_mid_price(market.yes_token_id)
+            from scripts.polymarket_client import get_orderbook_snapshot
+            snap = get_orderbook_snapshot(market.yes_token_id)
+            p_market     = snap.get("mid")
+            yes_ask_live = snap["asks"][0][0] if snap.get("asks") else None
+            yes_bid_live = snap["bids"][0][0] if snap.get("bids") else None
             print_market_summary(market, p_model=p_model)
         else:
             print(f"  Market {args.condition_id[:16]}... not found.")
@@ -173,12 +179,24 @@ def run(args):
             print("  Cancelled — no orders posted.")
             return
 
+        TICK = 0.01
+        # Clamp to stay below current ask (ensures resting maker orders, not taker crosses)
+        t1 = quote.bid
+        t2 = round(1.0 - quote.ask, 2)
+        if yes_ask_live is not None:
+            t1 = min(t1, round(yes_ask_live - TICK, 2))
+        if yes_bid_live is not None:
+            no_ask_mkt = round(1.0 - yes_bid_live, 2)
+            t2 = min(t2, round(no_ask_mkt - TICK, 2))
+
         posted = post_two_sided_quote(
-            token_id  = market.yes_token_id,
-            bid_price = quote.bid,
-            ask_price = quote.ask,
-            size      = args.size,
-            dry_run   = False,
+            token_id     = market.yes_token_id,
+            no_token_id  = market.no_token_id,
+            condition_id = market.condition_id,
+            t1_price     = t1,
+            t2_price     = t2,
+            size         = args.size,
+            dry_run      = False,
         )
         print(f"\nOrders posted successfully.")
         print(f"  Bid order ID: {posted.bid_order_id}")
@@ -187,12 +205,22 @@ def run(args):
         print(f"  python -m scripts.run_maker --cancel --condition-id {market.condition_id}")
     else:
         print("Step 4 — Dry run (add --live to post real orders):")
+        TICK = 0.01
+        t1 = quote.bid
+        t2 = round(1.0 - quote.ask, 2)
+        if yes_ask_live is not None:
+            t1 = min(t1, round(yes_ask_live - TICK, 2))
+        if yes_bid_live is not None:
+            no_ask_mkt = round(1.0 - yes_bid_live, 2)
+            t2 = min(t2, round(no_ask_mkt - TICK, 2))
         post_two_sided_quote(
-            token_id  = market.yes_token_id,
-            bid_price = quote.bid,
-            ask_price = quote.ask,
-            size      = args.size,
-            dry_run   = True,
+            token_id     = market.yes_token_id,
+            no_token_id  = market.no_token_id,
+            condition_id = market.condition_id,
+            t1_price     = t1,
+            t2_price     = t2,
+            size         = args.size,
+            dry_run      = True,
         )
         print(f"\nAdd --live to submit these orders to Polymarket.")
 
