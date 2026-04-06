@@ -368,190 +368,173 @@ left_col, right_col = st.columns([1.1, 2.0], gap="large")
 
 with left_col:
 
-    # ── Market odds ──────────────────────────────────────────────────────────
+    # ── Market odds (auto-refreshes every 30s) ───────────────────────────────
 
     st.markdown('<div class="s-hdr">Market Odds</div>', unsafe_allow_html=True)
 
-    # Auto-fetch (cached 60s); manual refresh with button
-    price_refresh = st.button("↻ Refresh prices", key="price_refresh", use_container_width=False)
-    if price_refresh:
-        fetch_orderbook.clear()
+    # Capture market identifiers for the fragment closure
+    _yes_tid  = sel_market.yes_token_id
+    _no_tid   = sel_market.no_token_id
+    _cond_id  = sel_market.condition_id
+    _pk       = f"prices_{_cond_id}"   # session-state key for price data
 
-    try:
-        snap, fetched_at = fetch_prices(sel_market.yes_token_id)
-        age = int(time.time() - fetched_at)
-        if age < 30:
-            ts_html = f'<span class="ts-fresh">● live  ({age}s ago)</span>'
-        elif age < 90:
-            ts_html = f'<span class="ts-fresh">● {age}s ago</span>'
+    @st.fragment(run_every=30)
+    def _market_odds_fragment():
+        try:
+            snap, fetched_at = fetch_orderbook(_yes_tid)
+            age = int(time.time() - fetched_at)
+            ts_cls = "ts-fresh" if age < 60 else "ts-stale"
+            ts_sym = "●" if age < 60 else "⚠"
+            st.markdown(
+                f'<span class="{ts_cls}">{ts_sym} {age}s ago</span>',
+                unsafe_allow_html=True,
+            )
+        except Exception:
+            snap = None
+            st.markdown('<span class="ts-none">— price unavailable</span>', unsafe_allow_html=True)
+
+        # Parse YES token prices
+        if snap and snap.get("mid") is not None:
+            ym  = snap["mid"]
+            yb  = snap["bids"][0][0] if snap.get("bids") else None
+            ya  = snap["asks"][0][0] if snap.get("asks") else None
+            nm  = round(1.0 - ym, 4)
+            nb  = round(1.0 - ya, 4) if ya is not None else None
+            na  = round(1.0 - yb, 4) if yb is not None else None
         else:
-            ts_html = f'<span class="ts-stale">⚠ stale ({age}s ago)</span>'
-        st.markdown(ts_html, unsafe_allow_html=True)
-    except Exception as e:
-        snap, fetched_at = None, None
-        st.markdown('<span class="ts-none">— price unavailable</span>', unsafe_allow_html=True)
+            ym = yb = ya = nm = nb = na = None
 
-    if snap and snap.get("mid") is not None:
-        yes_mid = snap["mid"]
-        yes_bid = snap["bids"][0][0] if snap.get("bids") else None
-        yes_ask = snap["asks"][0][0] if snap.get("asks") else None
-        no_mid  = 1.0 - yes_mid
-        no_bid  = (1.0 - yes_ask) if yes_ask is not None else None
-        no_ask  = (1.0 - yes_bid) if yes_bid is not None else None
-        p_market_yes = yes_mid
-    else:
-        yes_mid = yes_bid = yes_ask = no_mid = no_bid = no_ask = None
-        p_market_yes = None
+        # Persist for the quote builder (outside the fragment)
+        st.session_state[_pk] = {
+            "yes_mid": ym, "yes_bid": yb, "yes_ask": ya,
+            "no_mid":  nm, "no_bid":  nb, "no_ask":  na,
+            "snap": snap,
+        }
 
-    # Price grid
-    def _fmt_cents(v) -> str:
-        return f"{v*100:.1f}¢" if v is not None else "—"
+        # Price display
+        def _fmt(v): return f"{v*100:.1f}¢" if v is not None else "—"
+        def _phtml(team, mid, bid, ask):
+            return (
+                f'<div class="price-block">'
+                f'<div class="price-team">{team}</div>'
+                f'<div class="price-mid">{_fmt(mid)}</div>'
+                f'<div class="price-ba">bid {_fmt(bid)} / ask {_fmt(ask)}</div>'
+                f'</div>'
+            )
+        pc1, pc2 = st.columns(2)
+        with pc1:
+            st.markdown(_phtml(poly_t1, ym, yb, ya), unsafe_allow_html=True)
+        with pc2:
+            st.markdown(_phtml(poly_t2, nm, nb, na), unsafe_allow_html=True)
 
-    def _price_html(team, mid, bid, ask) -> str:
-        mid_str = _fmt_cents(mid)
-        ba_str  = f"bid {_fmt_cents(bid)} / ask {_fmt_cents(ask)}"
-        return (
-            f'<div class="price-block">'
-            f'<div class="price-team">{team}</div>'
-            f'<div class="price-mid">{mid_str}</div>'
-            f'<div class="price-ba">{ba_str}</div>'
-            f'</div>'
-        )
+        if ym is not None:
+            pct = int(ym * 100)
+            st.markdown(
+                f'<div class="prob-bar-wrap">'
+                f'<div class="prob-bar-outer"><div class="prob-bar-inner" style="width:{pct}%"></div></div>'
+                f'<div class="prob-bar-labels"><span>{poly_t1} {pct}%</span><span>{poly_t2} {100-pct}%</span></div>'
+                f'</div>',
+                unsafe_allow_html=True,
+            )
 
-    pc1, pc2 = st.columns(2)
-    with pc1:
-        st.markdown(_price_html(poly_t1, yes_mid, yes_bid, yes_ask), unsafe_allow_html=True)
-    with pc2:
-        st.markdown(_price_html(poly_t2, no_mid, no_bid, no_ask), unsafe_allow_html=True)
+        # Orderbook depth — fetch both sides independently
+        try:
+            snap_no, _ = fetch_orderbook(_no_tid)
+        except Exception:
+            snap_no = None
 
-    # Implied probability bar
-    if yes_mid is not None:
-        pct = int(yes_mid * 100)
-        st.markdown(
-            f'<div class="prob-bar-wrap">'
-            f'<div class="prob-bar-outer"><div class="prob-bar-inner" style="width:{pct}%"></div></div>'
-            f'<div class="prob-bar-labels"><span>{poly_t1} {pct}%</span><span>{poly_t2} {100-pct}%</span></div>'
-            f'</div>',
-            unsafe_allow_html=True,
-        )
+        if snap and (snap.get("bids") or snap.get("asks")):
+            yes_bids = snap.get("bids", [])
+            yes_asks = snap.get("asks", [])
+            yes_spr  = round((yes_asks[0][0] - yes_bids[0][0]) * 100, 1) if yes_bids and yes_asks else None
+
+            if snap_no and (snap_no.get("bids") or snap_no.get("asks")):
+                no_bids  = snap_no.get("bids", [])
+                no_asks  = snap_no.get("asks", [])
+                no_mid_v = snap_no.get("mid")
+                no_spr   = round((no_asks[0][0] - no_bids[0][0]) * 100, 1) if no_bids and no_asks else None
+            else:
+                no_bids = no_asks = []
+                no_mid_v = nm
+                no_spr = None
+
+            def _book_html(bids, asks, mid_val, spr, depth=5):
+                rows = ""
+                for p, s in reversed(asks[:depth]):
+                    rows += (f"<tr><td style='color:#fc8181;text-align:right;padding:1px 6px'>{p*100:.1f}¢</td>"
+                             f"<td style='color:#4a5568;text-align:right;padding:1px 6px'>{s:.0f}</td>"
+                             f"<td style='padding:1px 6px'></td></tr>")
+                mid_str = f"{mid_val*100:.1f}¢" if mid_val else "—"
+                rows += (f"<tr style='background:#2d3748'><td colspan='3' style='text-align:center;"
+                         f"font-size:10px;color:#a0aec0;padding:2px 6px'>"
+                         f"{mid_str}{'  sprd '+str(spr)+'¢' if spr else ''}</td></tr>")
+                for p, s in bids[:depth]:
+                    rows += (f"<tr><td style='padding:1px 6px'></td>"
+                             f"<td style='color:#4a5568;text-align:right;padding:1px 6px'>{s:.0f}</td>"
+                             f"<td style='color:#48bb78;padding:1px 6px'>{p*100:.1f}¢</td></tr>")
+                return (f'<table style="width:100%;border-collapse:collapse;font-size:11px">'
+                        f'<thead><tr>'
+                        f'<th style="color:#fc8181;text-align:right;padding:2px 6px">Ask</th>'
+                        f'<th style="color:#4a5568;text-align:right;padding:2px 6px">Qty</th>'
+                        f'<th style="color:#48bb78;padding:2px 6px">Bid</th>'
+                        f'</tr></thead><tbody>{rows}</tbody></table>')
+
+            ob1, ob2 = st.columns(2)
+            with ob1:
+                st.markdown(f'<div class="lbl" style="margin:10px 0 4px">{poly_t1} token</div>'
+                            + _book_html(yes_bids, yes_asks, ym, yes_spr),
+                            unsafe_allow_html=True)
+            with ob2:
+                st.markdown(f'<div class="lbl" style="margin:10px 0 4px">{poly_t2} token</div>'
+                            + _book_html(no_bids, no_asks, no_mid_v, no_spr),
+                            unsafe_allow_html=True)
+
+        # Volume & liquidity
+        try:
+            vol = fetch_market_volume(_cond_id)
+            if vol["volume"] > 0 or vol["liquidity"] > 0:
+                st.markdown(
+                    f'<div style="display:flex;gap:16px;margin:8px 0 4px;font-size:11px">'
+                    f'<div><span style="color:#718096">Total volume</span>  <b>${vol["volume"]:,.0f}</b></div>'
+                    f'<div><span style="color:#718096">Liquidity</span>  <b>${vol["liquidity"]:,.0f}</b></div>'
+                    f'</div>',
+                    unsafe_allow_html=True,
+                )
+        except Exception:
+            pass
+
+        # Price history chart
+        try:
+            import pandas as pd
+            history = fetch_price_history(_yes_tid)
+            if len(history) >= 3:
+                df_hist = pd.DataFrame(history)
+                df_hist["t"] = pd.to_datetime(df_hist["t"], unit="s", utc=True)
+                df_hist = df_hist.rename(columns={"t": "time", "p": poly_t1})
+                df_hist = df_hist.set_index("time")
+                st.markdown('<div class="lbl" style="margin:8px 0 2px">Price history (7d)</div>',
+                            unsafe_allow_html=True)
+                st.line_chart(df_hist, height=120, use_container_width=True)
+        except Exception:
+            pass
+
+    _market_odds_fragment()
+
+    # Read prices written by fragment (available immediately after fragment runs)
+    _pd = st.session_state.get(_pk, {})
+    yes_mid      = _pd.get("yes_mid")
+    yes_bid      = _pd.get("yes_bid")
+    yes_ask      = _pd.get("yes_ask")
+    no_mid       = _pd.get("no_mid")
+    no_bid       = _pd.get("no_bid")
+    no_ask       = _pd.get("no_ask")
+    p_market_yes = yes_mid
 
     if p_market_yes is None:
         p_market_yes = st.number_input(
             f"Manual mid — P({poly_t1})", 0.01, 0.99, 0.50, 0.01, "%.2f",
             key="manual_mid",
         )
-
-    # ── Orderbook depth ──────────────────────────────────────────────────────
-
-    # Fetch NO token orderbook independently — it's a separate book with its own liquidity
-    try:
-        snap_no, _ = fetch_orderbook(sel_market.no_token_id)
-    except Exception:
-        snap_no = None
-
-    if snap and (snap.get("bids") or snap.get("asks")):
-        yes_bids = snap.get("bids", [])
-        yes_asks = snap.get("asks", [])
-        yes_spread = round((yes_asks[0][0] - yes_bids[0][0]) * 100, 1) if yes_bids and yes_asks else None
-
-        if snap_no and (snap_no.get("bids") or snap_no.get("asks")):
-            no_bids   = snap_no.get("bids", [])
-            no_asks   = snap_no.get("asks", [])
-            no_mid_ob = snap_no.get("mid")
-            no_spread = round((no_asks[0][0] - no_bids[0][0]) * 100, 1) if no_bids and no_asks else None
-        else:
-            no_bids = no_asks = []
-            no_mid_ob = no_mid
-            no_spread = None
-
-        def _book_html(bids, asks, mid_val, spread_val, depth=5):
-            rows = ""
-            for p, s in reversed(asks[:depth]):
-                rows += (
-                    f"<tr>"
-                    f"<td style='color:#fc8181;text-align:right;padding:1px 6px'>{p*100:.1f}¢</td>"
-                    f"<td style='color:#4a5568;text-align:right;padding:1px 6px'>{s:.0f}</td>"
-                    f"<td style='padding:1px 6px'></td>"
-                    f"</tr>"
-                )
-            mid_str    = f"{mid_val*100:.1f}¢" if mid_val else "—"
-            spread_str = f"sprd {spread_val:.1f}¢" if spread_val else ""
-            rows += (
-                f"<tr style='background:#2d3748'>"
-                f"<td colspan='3' style='text-align:center;font-size:10px;"
-                f"color:#a0aec0;padding:2px 6px'>{mid_str}  {spread_str}</td>"
-                f"</tr>"
-            )
-            for p, s in bids[:depth]:
-                rows += (
-                    f"<tr>"
-                    f"<td style='padding:1px 6px'></td>"
-                    f"<td style='color:#4a5568;text-align:right;padding:1px 6px'>{s:.0f}</td>"
-                    f"<td style='color:#48bb78;padding:1px 6px'>{p*100:.1f}¢</td>"
-                    f"</tr>"
-                )
-            return (
-                f'<table style="width:100%;border-collapse:collapse;font-size:11px">'
-                f'<thead><tr>'
-                f'<th style="color:#fc8181;text-align:right;padding:2px 6px;font-weight:600">Ask</th>'
-                f'<th style="color:#4a5568;text-align:right;padding:2px 6px;font-weight:600">Qty</th>'
-                f'<th style="color:#48bb78;padding:2px 6px;font-weight:600">Bid</th>'
-                f'</tr></thead>'
-                f'<tbody>{rows}</tbody>'
-                f'</table>'
-            )
-
-        ob1_html = _book_html(yes_bids, yes_asks, yes_mid,    yes_spread)
-        ob2_html = _book_html(no_bids,  no_asks,  no_mid_ob, no_spread)
-
-        ob_col1, ob_col2 = st.columns(2)
-        with ob_col1:
-            st.markdown(
-                f'<div class="lbl" style="margin:10px 0 4px">{poly_t1} token</div>'
-                + ob1_html,
-                unsafe_allow_html=True,
-            )
-        with ob_col2:
-            st.markdown(
-                f'<div class="lbl" style="margin:10px 0 4px">{poly_t2} token</div>'
-                + ob2_html,
-                unsafe_allow_html=True,
-            )
-
-    # ── Volume & liquidity ───────────────────────────────────────────────────
-
-    try:
-        vol_data = fetch_market_volume(sel_market.condition_id)
-        if vol_data["volume"] > 0 or vol_data["liquidity"] > 0:
-            st.markdown(
-                f'<div style="display:flex;gap:16px;margin:8px 0 4px;font-size:11px">'
-                f'<div><span style="color:#718096">Total volume</span>  '
-                f'<b>${vol_data["volume"]:,.0f}</b></div>'
-                f'<div><span style="color:#718096">Liquidity</span>  '
-                f'<b>${vol_data["liquidity"]:,.0f}</b></div>'
-                f'</div>',
-                unsafe_allow_html=True,
-            )
-    except Exception:
-        pass
-
-    # ── Price history ────────────────────────────────────────────────────────
-
-    try:
-        import pandas as pd
-        history = fetch_price_history(sel_market.yes_token_id)
-        if len(history) >= 3:
-            df_hist = pd.DataFrame(history)
-            df_hist["t"] = pd.to_datetime(df_hist["t"], unit="s", utc=True)
-            df_hist = df_hist.rename(columns={"t": "time", "p": poly_t1})
-            df_hist = df_hist.set_index("time")
-            st.markdown(
-                '<div class="lbl" style="margin:8px 0 2px">Price history (7d)</div>',
-                unsafe_allow_html=True,
-            )
-            st.line_chart(df_hist, height=120, use_container_width=True)
-    except Exception:
-        pass
 
     # ── Team stats ───────────────────────────────────────────────────────────
 
@@ -668,32 +651,22 @@ with right_col:
 
     st.markdown('<div class="s-hdr">Model Signals</div>', unsafe_allow_html=True)
 
-    # Check for cached results for this market + team pair
+    # Auto-run models whenever the market + team selection changes
     _res_key = f"{sel_market.condition_id}|{team1}|{team2}"
     if st.session_state.get("model_results_key") != _res_key:
-        model_results = {}
-    else:
-        model_results = st.session_state.get("model_results", {})
-
-    run_btn = st.button(
-        "▶  Run all models",
-        type="primary",
-        use_container_width=False,
-        key="run_models_btn",
-    )
-
-    if run_btn:
-        if team1 == team2:
-            st.error("Teams must be different.")
-        else:
-            with st.spinner(f"Running {len(bundles)} models..."):
-                ctx_key = f"{context['league']}|{context['split']}|{context['patch']}|{context['playoffs']}"
+        if team1 != team2:
+            ctx_key = f"{context['league']}|{context['split']}|{context['patch']}|{context['playoffs']}"
+            with st.spinner(f"Running models — {team1} vs {team2}…"):
                 model_results = run_models(team1, team2, ctx_key, context)
             st.session_state["model_results"]       = model_results
             st.session_state["model_results_cid"]   = sel_market.condition_id
             st.session_state["model_results_key"]   = _res_key
             st.session_state["model_results_team1"] = team1
             st.session_state["model_results_team2"] = team2
+        else:
+            model_results = {}
+    else:
+        model_results = st.session_state.get("model_results", {})
 
     if model_results:
         from scripts.predict_match import series_win_prob
