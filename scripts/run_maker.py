@@ -38,8 +38,10 @@ from scripts.predict_match  import predict_match, load_bundle, load_feat_df, ser
 from scripts.polymarket_client import (
     get_client, find_lol_markets, get_market_by_condition_id,
     get_mid_price, print_market_summary, post_two_sided_quote,
-    cancel_all_orders, get_open_orders, check_order_scoring,
-    check_reward_percentages, check_reward_earnings, check_market_rewards,
+    post_single_side_quote, cancel_all_orders, get_open_orders,
+    check_order_scoring, check_reward_percentages, check_reward_earnings,
+    check_market_rewards, find_reward_markets, print_reward_markets,
+    merge_positions,
 )
 from pipeline.betting import (
     market_maker_quotes, QuoteParams, fee_table, taker_fee_per_share,
@@ -51,33 +53,37 @@ from pipeline.models import ensemble_predict
 # ─── Fill monitoring ─────────────────────────────────────────────────────────
 
 def monitor_fills(
-    condition_id: str,
+    condition_id:  str,
     posted_bid_id: str | None,
     posted_ask_id: str | None,
-    yes_token_id: str,
-    p_fair: float = 0.5,
-    size: float = 30.0,
-    interval: int = 30,
-    max_checks: int = 60,
+    yes_token_id:  str,
+    no_token_id:   str | None = None,
+    bid_price:     float = 0.0,
+    ask_price:     float = 0.0,
+    p_fair:        float = 0.5,
+    size:          float = 30.0,
+    interval:      int   = 30,
+    max_checks:    int   = 60,
+    adverse_threshold: float = 0.02,
 ) -> None:
     """
-    Poll for fills and implement adverse selection defense.
+    Three-tier fill monitor with Avellaneda-Stoikov inventory management.
 
-    After posting orders, checks every `interval` seconds.
-    If one side fills and the market moves against us by > 2 cents,
-    cancels the remaining side to prevent being picked off.
+    Tier 1 (continuous): Quote skew is handled at post time via PositionState.
+    Tier 2 (on single fill): Cancel unfilled side, re-post it tighter (0.5¢ closer
+        to current mid) to attract the complementary fill and hedge the position.
+    Tier 3 (adverse selection): If after Tier 2 repost the market moves >2¢ against
+        the filled position, cancel all and exit — we were picked off by informed flow.
 
-    Parameters
-    ----------
-    condition_id   : market condition ID
-    posted_bid_id  : order ID for the bid (YES buy)
-    posted_ask_id  : order ID for the ask (NO buy)
-    yes_token_id   : YES token ID for price checks
-    interval       : seconds between checks
-    max_checks     : max number of checks before stopping
+    When both sides fill: calls merge_positions to recycle capital to USDC.
+    Drift warning: if mid moves >1.5¢ with no fill, warns to re-quote.
     """
     import time
     from scripts.polymarket_client import get_orderbook_snapshot
+
+    TICK = 0.01
+    DRIFT_WARN  = 0.015   # warn if mid drifts this far with no fill
+    TIGHTER_ADJ = 0.005   # Tier 2: re-post this much closer to mid
 
     position = PositionState()
     bid_alive = posted_bid_id is not None
@@ -88,8 +94,13 @@ def monitor_fills(
     print(f"  Ask order: {posted_ask_id[:12] if posted_ask_id else 'none'}")
     print(f"  Press Ctrl+C to stop.\n")
 
-    initial_snap = get_orderbook_snapshot(yes_token_id)
-    initial_mid = initial_snap.get("mid")
+    snap = get_orderbook_snapshot(yes_token_id)
+    original_mid = snap.get("mid") or p_fair
+
+    # State for three-tier logic
+    fill_mid: float | None = None   # mid captured at fill detection time (Tier 3 anchor)
+    requote_id: str | None = None   # order ID of Tier 2 re-posted order
+    requote_side: str | None = None # "YES" or "NO"
 
     for check in range(max_checks):
         try:
@@ -98,55 +109,94 @@ def monitor_fills(
             print("\nMonitoring stopped by user.")
             return
 
-        # Check which orders are still open
         open_orders = get_open_orders(condition_id)
-        open_ids = {o.get("id") for o in open_orders}
+        open_ids = {o.get("id") or o.get("orderID") for o in open_orders}
 
         bid_filled = bid_alive and posted_bid_id not in open_ids
         ask_filled = ask_alive and posted_ask_id not in open_ids
 
+        # Detect fills and record position
         if bid_filled:
             position.update_fill("YES", size, p_fair)
-            print(f"  [{check+1}] BID FILLED (YES buy)  exposure={position.net_exposure(p_fair):+.2f}")
             bid_alive = False
+            print(f"  [{check+1}] BID FILLED — bought {size:.0f} YES @ {bid_price:.3f}  "
+                  f"net_exposure={position.net_exposure(p_fair):+.2f}")
+
         if ask_filled:
             position.update_fill("NO", size, 1.0 - p_fair)
-            print(f"  [{check+1}] ASK FILLED (NO buy)  exposure={position.net_exposure(p_fair):+.2f}")
             ask_alive = False
+            print(f"  [{check+1}] ASK FILLED — bought {size:.0f} NO @ {ask_price:.3f}  "
+                  f"net_exposure={position.net_exposure(p_fair):+.2f}")
 
+        # ── Both filled → fully hedged, merge and exit ────────────────────────
         if not bid_alive and not ask_alive:
-            print(f"\n  Both sides filled — spread captured!")
+            if position.is_flat or (position.yes_shares > 0 and position.no_shares > 0):
+                print(f"\n  Both sides filled — spread captured!")
+                merge_positions(condition_id, min(position.yes_shares, position.no_shares))
             return
 
-        # One side filled: check for adverse selection
-        if (bid_filled or ask_filled) and (bid_alive or ask_alive):
-            snap = get_orderbook_snapshot(yes_token_id)
-            current_mid = snap.get("mid")
+        # Fetch current mid for drift/adverse checks
+        current_snap = get_orderbook_snapshot(yes_token_id)
+        current_mid  = current_snap.get("mid") or original_mid
 
-            if initial_mid and current_mid:
-                move = current_mid - initial_mid
-                print(f"  Market moved: {move:+.3f} since order post")
-
-                # Adverse selection: market moved against our filled position
-                adverse = False
-                if bid_filled and move < -0.02:
-                    # We bought YES, market dropped → adverse
-                    adverse = True
-                    print(f"  ⚠ ADVERSE: bought YES but market dropped {move:.3f}")
-                elif ask_filled and move > 0.02:
-                    # We bought NO, market rose → adverse
-                    adverse = True
-                    print(f"  ⚠ ADVERSE: bought NO but market rose {move:+.3f}")
-
-                if adverse:
-                    remaining = "bid" if bid_alive else "ask"
-                    print(f"  Cancelling remaining {remaining} to limit exposure...")
+        # ── Tier 2: one side just filled → aggressive requote ─────────────────
+        if (bid_filled or ask_filled) and fill_mid is None:
+            fill_mid = current_mid   # anchor Tier 3 to THIS moment
+            if no_token_id:
+                if bid_filled and ask_alive:
+                    # YES filled, NO still resting — re-post NO tighter
+                    no_mid = 1.0 - current_mid
+                    new_ask_price = round(min(no_mid + TIGHTER_ADJ, 0.99), 2)
+                    print(f"  Tier 2: YES filled → cancelling NO, re-posting tighter @ {new_ask_price:.2f}...")
                     cancel_all_orders(condition_id)
-                    print(f"  Done — adverse selection defense triggered.")
-                    return
+                    ask_alive = False
+                    requote_id = post_single_side_quote(no_token_id, condition_id, new_ask_price, size)
+                    requote_side = "NO"
+                    print(f"  Re-quote posted: {str(requote_id)[:12] if requote_id else 'failed'}")
 
-        if not bid_filled and not ask_filled:
-            print(f"  [{check+1}] Both orders still resting...")
+                elif ask_filled and bid_alive:
+                    # NO filled, YES still resting — re-post YES tighter
+                    new_bid_price = round(max(current_mid - TIGHTER_ADJ, 0.01), 2)
+                    print(f"  Tier 2: NO filled → cancelling YES, re-posting tighter @ {new_bid_price:.2f}...")
+                    cancel_all_orders(condition_id)
+                    bid_alive = False
+                    requote_id = post_single_side_quote(yes_token_id, condition_id, new_bid_price, size)
+                    requote_side = "YES"
+                    print(f"  Re-quote posted: {str(requote_id)[:12] if requote_id else 'failed'}")
+            else:
+                # No no_token_id available — fall back to cancel only
+                print(f"  One side filled (no_token_id not set, skipping Tier 2 re-quote)")
+
+        # ── Tier 3: adverse selection check after Tier 2 requote ─────────────
+        if fill_mid is not None and requote_id is not None:
+            move = current_mid - fill_mid
+            adverse = False
+            if requote_side == "NO" and move < -adverse_threshold:
+                # Bought YES (bid filled), market dropped → adverse
+                print(f"  ⚠ ADVERSE: bought YES, market dropped {move:.3f} since fill")
+                adverse = True
+            elif requote_side == "YES" and move > adverse_threshold:
+                # Bought NO (ask filled), market rose → adverse
+                print(f"  ⚠ ADVERSE: bought NO, market rose {move:+.3f} since fill")
+                adverse = True
+            if adverse:
+                cancel_all_orders(condition_id)
+                print(f"  Tier 3 triggered — all orders cancelled.")
+                return
+
+            # Check if Tier 2 requote filled (hedge complete)
+            if requote_id not in open_ids:
+                print(f"\n  Tier 2 re-quote filled — fully hedged!")
+                merge_positions(condition_id, size)
+                return
+
+        # ── Drift warning: no fill, mid has moved away ────────────────────────
+        if fill_mid is None and bid_alive and ask_alive:
+            drift = abs(current_mid - original_mid)
+            if drift > DRIFT_WARN:
+                print(f"  [{check+1}] ⚠ Mid drifted {drift*100:.1f}¢ from entry — consider re-quoting")
+            else:
+                print(f"  [{check+1}] Both orders resting  mid={current_mid:.3f}  drift={drift*100:.1f}¢")
 
     print(f"\nMax checks reached ({max_checks}). Stopping monitor.")
 
@@ -177,6 +227,35 @@ def run(args):
             sys.exit(1)
         check_order_scoring(args.order_ids)
         return
+
+    # ── 2b. Find reward markets mode ─────────────────────────────────────────
+    if args.find_reward_markets:
+        print(f"Scanning all reward markets (max capital/side=${args.max_capital:.0f}, "
+              f"min daily rate=${args.min_daily_rate:.0f})...")
+        markets_rw = find_reward_markets(
+            max_capital_per_side=args.max_capital,
+            min_daily_rate=args.min_daily_rate,
+        )
+        print_reward_markets(markets_rw)
+        return
+
+    # ── 2c. Auto-scout: pick best reward market automatically ─────────────────
+    if args.auto_scout:
+        print(f"Auto-scout: finding best reward market (max_capital=${args.max_capital:.0f}, "
+              f"min_daily_rate=${args.min_daily_rate:.0f})...")
+        markets_rw = find_reward_markets(
+            max_capital_per_side=args.max_capital,
+            min_daily_rate=args.min_daily_rate,
+        )
+        if not markets_rw:
+            print("No qualifying reward markets found. Adjust --max-capital or --min-daily-rate.")
+            return
+        # Score: high daily rate, low competition
+        best = max(markets_rw, key=lambda m: m.daily_rate / max(m.competitiveness, 0.1))
+        print(f"  → Selected: {best.question[:65]}")
+        print(f"     Daily rate: ${best.daily_rate:.0f}  Comp: {best.competitiveness:.1f}  Capital/side: ${best.capital_per_side:.0f}")
+        args.condition_id = best.condition_id
+        # Fall through to any-market quote mode below
 
     # ── 2b. Check earnings mode ───────────────────────────────────────────────
     if args.check_earnings:
@@ -221,58 +300,67 @@ def run(args):
         cancel_all_orders(args.condition_id)
         return
 
-    # ── 4. Predict + quote mode ───────────────────────────────────────────────
-    if not args.team1 or not args.team2:
-        print("ERROR: --team1 and --team2 are required")
+    # ── 4. Quote mode ─────────────────────────────────────────────────────────
+    lol_mode = bool(args.team1 and args.team2)
+    any_market_mode = bool(args.condition_id and not lol_mode)
+
+    if not lol_mode and not any_market_mode:
+        print("ERROR: provide --team1 and --team2 (LoL mode) or --condition-id alone (any-market mode)")
         sys.exit(1)
 
-    context = {
-        "league":   args.league,
-        "split":    args.split,
-        "playoffs": args.playoffs,
-        "patch":    args.patch,
-        "game":     args.game,
-    }
+    p_model = None
+    model_std = 0.0
 
-    # Step 1: model prediction (ensemble over all bundles)
-    print("Step 1 — Loading models and predicting (ensemble)...")
-    feat_df = load_feat_df()
+    if lol_mode:
+        context = {
+            "league":   args.league,
+            "split":    args.split,
+            "playoffs": args.playoffs,
+            "patch":    args.patch,
+            "game":     args.game,
+        }
 
-    weights_path = ROOT / "cache" / "ensemble_weights.json"
-    ensemble_weights = json.load(open(weights_path)) if weights_path.exists() else None
+        # Step 1: model prediction (ensemble over all bundles)
+        print("Step 1 — Loading models and predicting (ensemble)...")
+        feat_df = load_feat_df()
 
-    all_preds: dict[str, float] = {}
-    first_pred = None
-    for bpath in sorted((ROOT / "cache").glob("model_bundle_*.pkl")):
-        key = bpath.stem.replace("model_bundle_", "")
-        if not key:
-            continue
-        bundle = pickle.load(open(bpath, "rb"))
-        try:
-            r = predict_match(args.team1, args.team2, context, bundle, feat_df,
-                              verbose=(first_pred is None))
-            all_preds[key] = r["p_model"]
-            if first_pred is None:
-                first_pred = r
-        except Exception as e:
-            print(f"  [{key}] failed: {e}")
+        weights_path = ROOT / "cache" / "ensemble_weights.json"
+        ensemble_weights = json.load(open(weights_path)) if weights_path.exists() else None
 
-    if not all_preds:
-        print("ERROR: all model predictions failed.")
-        sys.exit(1)
+        all_preds: dict[str, float] = {}
+        first_pred = None
+        for bpath in sorted((ROOT / "cache").glob("model_bundle_*.pkl")):
+            key = bpath.stem.replace("model_bundle_", "")
+            if not key:
+                continue
+            bundle = pickle.load(open(bpath, "rb"))
+            try:
+                r = predict_match(args.team1, args.team2, context, bundle, feat_df,
+                                  verbose=(first_pred is None))
+                all_preds[key] = r["p_model"]
+                if first_pred is None:
+                    first_pred = r
+            except Exception as e:
+                print(f"  [{key}] failed: {e}")
 
-    p_model, model_std = ensemble_predict(all_preds, weights=ensemble_weights)
-    weight_mode = "weighted" if ensemble_weights else "equal weights"
-    print(f"\n  Ensemble: p={p_model:.3f}  σ={model_std:.4f}  ({len(all_preds)} models, {weight_mode})")
-    for k, p in sorted(all_preds.items()):
-        print(f"    {k:<15} {p:.3f}")
+        if not all_preds:
+            print("ERROR: all model predictions failed.")
+            sys.exit(1)
 
-    # Optional: show series probability
-    if args.format != "Bo1":
-        p_series = series_win_prob(p_model, args.format)
-        print(f"  Series win prob ({args.format}): {p_series:.1%}\n")
-        print(f"  NOTE: If the Polymarket market is for the SERIES winner,")
-        print(f"  use p_series={p_series:.3f} instead of p_model={p_model:.3f}\n")
+        p_model, model_std = ensemble_predict(all_preds, weights=ensemble_weights)
+        weight_mode = "weighted" if ensemble_weights else "equal weights"
+        print(f"\n  Ensemble: p={p_model:.3f}  σ={model_std:.4f}  ({len(all_preds)} models, {weight_mode})")
+        for k, p in sorted(all_preds.items()):
+            print(f"    {k:<15} {p:.3f}")
+
+        # Optional: show series probability
+        if args.format != "Bo1":
+            p_series = series_win_prob(p_model, args.format)
+            print(f"  Series win prob ({args.format}): {p_series:.1%}\n")
+            print(f"  NOTE: If the Polymarket market is for the SERIES winner,")
+            print(f"  use p_series={p_series:.3f} instead of p_model={p_model:.3f}\n")
+    else:
+        print("Step 1 — Any-market mode: fair value = current mid (no directional model)")
 
     # Step 2: get market price
     p_market = None
@@ -299,6 +387,10 @@ def run(args):
 
     if p_market is None:
         p_market = float(input("Enter current Polymarket mid price (e.g. 0.55): ").strip())
+
+    # In any-market mode, fair value = current mid (no directional signal)
+    if p_model is None:
+        p_model = p_market
 
     # Compute hours until match from market end date
     hours_to_match = 168.0
@@ -412,6 +504,9 @@ def run(args):
                 posted_bid_id=posted.bid_order_id,
                 posted_ask_id=posted.ask_order_id,
                 yes_token_id=market.yes_token_id,
+                no_token_id=market.no_token_id,
+                bid_price=posted.bid_price,
+                ask_price=posted.ask_price,
                 p_fair=quote.mid,
                 size=args.size,
                 interval=args.monitor_interval,
@@ -492,6 +587,14 @@ def main():
                         help="Monitor fills after posting (adverse selection defense)")
     parser.add_argument("--monitor-interval", type=int, default=30,
                         help="Seconds between fill checks (default: 30)")
+    parser.add_argument("--find-reward-markets", action="store_true",
+                        help="Scan all reward markets ranked by daily rate")
+    parser.add_argument("--auto-scout",          action="store_true",
+                        help="Auto-pick best reward market by rate/competitiveness and post quotes")
+    parser.add_argument("--max-capital",   type=float, default=1000.0,
+                        help="Max capital per side in USD for --find-reward-markets / --auto-scout (default: 1000)")
+    parser.add_argument("--min-daily-rate", type=float, default=10.0,
+                        help="Minimum daily reward pool in USD (default: 10)")
 
     args = parser.parse_args()
     run(args)

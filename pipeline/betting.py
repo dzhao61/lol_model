@@ -102,7 +102,7 @@ class PositionState:
 
     @property
     def is_flat(self) -> bool:
-        return self.yes_shares == 0 and self.no_shares == 0
+        return abs(self.yes_shares) < 1e-6 and abs(self.no_shares) < 1e-6
 
 
 # ─── Fee constants (LoL/Esports = Sports category) ────────────────────────────
@@ -123,6 +123,9 @@ LOL_LIVE_REWARD_TIER_AB = 3950.0 # $ per game, in-play (not our focus)
 
 # Max qualifying spread for liquidity rewards (configured per market; 3 cents typical)
 DEFAULT_MAX_REWARD_SPREAD = 0.03
+
+# Default minimum shares to qualify for rewards (override with per-market API value)
+MIN_REWARD_SHARES_DEFAULT = 500
 
 
 # ─── Core fee functions ───────────────────────────────────────────────────────
@@ -488,6 +491,7 @@ def market_maker_quotes(
     n_games_min:      int   = 30,
     hours_to_match:   float = 168.0,
     blend_alpha:      float | None = None,
+    position:         PositionState | None = None,
 ) -> Quote:
     """
     Compute bid/ask quotes for a Polymarket YES/NO market.
@@ -509,6 +513,7 @@ def market_maker_quotes(
     n_games_min      : min games played by either team (for alpha)
     hours_to_match   : hours until match starts (for alpha)
     blend_alpha      : override blending weight (None = compute dynamically)
+    position         : current PositionState for Avellaneda-Stoikov inventory skew
 
     Returns
     -------
@@ -533,15 +538,28 @@ def market_maker_quotes(
     fee      = taker_fee_per_share(p_market)
     net_edge = abs(edge) - fee           # positive = worth taking as a taker
 
-    # Inventory skew: lean toward value side (based on raw model edge)
-    skew = -np.sign(edge) * abs(edge) * 0.3 + params.inventory_skew
+    # Inventory skew: Avellaneda-Stoikov — shift both quotes toward mean reversion.
+    # If position is provided, use live inventory; otherwise fall back to params field.
+    half_spread = params.half_spread
+    if position is not None:
+        inv_skew = position.inventory_skew(p_fair, params.max_inventory, half_spread)
+    else:
+        inv_skew = params.inventory_skew
+    skew = -np.sign(edge) * abs(edge) * 0.3 + inv_skew
     mid  = _snap(p_fair)
-    bid  = _snap(mid - params.half_spread + skew)
-    ask  = _snap(mid + params.half_spread + skew)
+    bid  = _snap(mid - half_spread + skew)
+    ask  = _snap(mid + half_spread + skew)
 
     # Hard bounds
     bid = float(np.clip(bid, MIN_PRICE, mid - TICK_SIZE))
     ask = float(np.clip(ask, mid + TICK_SIZE, MAX_PRICE))
+
+    # Reward window clip: even after skew, keep quotes within qualifying spread.
+    # This ensures inventory skewing never accidentally pushes a quote out of the
+    # reward-earning window (which would drop Q_min to 0).
+    rw = params.max_reward_spread
+    bid = float(max(bid, p_market - rw))
+    ask = float(min(ask, p_market + rw))
 
     # Reward scores for each side (per-share score, pass size=1)
     bid_spread = abs(p_market - bid)

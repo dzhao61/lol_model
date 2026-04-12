@@ -1,12 +1,13 @@
 """
-Polymarket CLOB client wrapper for LoL market-making.
+Polymarket CLOB client wrapper for market-making across all categories.
 
 Handles:
 - Authentication (derived from private key)
-- Finding LoL markets by team names
+- Finding markets by team names (LoL) or condition ID (any market)
 - Fetching current mid price
 - Posting bid/ask quotes (GTC limit orders)
 - Cancelling orders before match start
+- Scanning reward markets across all categories
 """
 
 import json
@@ -98,6 +99,21 @@ class LoLMarket:
     no_token_id:   str
     end_date:      str
     active:        bool
+
+
+@dataclass
+class RewardMarket:
+    """A Polymarket market with active liquidity rewards."""
+    condition_id:      str
+    question:          str
+    daily_rate:        float   # USDC/day from native_daily_rate
+    max_spread_c:      float   # max qualifying spread in cents
+    min_shares:        int     # minimum shares per side to qualify
+    competitiveness:   float   # lower = less competition (0 = sole maker)
+    yes_price:         float   # current YES mid price
+    capital_per_side:  float   # min_shares × yes_price (USDC needed per side)
+    remaining_pool:    float   # remaining USDC in reward pool
+    category:          str = ""  # tag slug from Polymarket (e.g. "esports", "politics")
 
 
 # LoL-specific word-boundary patterns — prevent substring matches like
@@ -598,6 +614,29 @@ def post_directional_order(
     return order_id
 
 
+def post_single_side_quote(
+    token_id:     str,
+    condition_id: str,
+    price:        float,
+    size:         float,
+) -> str | None:
+    """
+    Post a single resting maker BUY order at exactly `price`.
+
+    Used for Tier 2 rebalancing: when one side fills, re-post the unfilled
+    side tighter (closer to current mid) to attract the complementary fill.
+    Unlike post_directional_order, this does NOT add a tick — it rests passively.
+    """
+    client = get_client()
+    order = client.create_and_post_order(
+        OrderArgs(token_id=token_id, side=BUY, price=price, size=size),
+        _order_options(condition_id),
+    )
+    order_id = order.get("orderID") if order else None
+    print(f"Re-quoted BUY  {size:.0f} @ {price:.2f}  [id: {str(order_id)[:8]}...]")
+    return order_id
+
+
 # ─── Order management ─────────────────────────────────────────────────────────
 
 def cancel_all_orders(condition_id: str) -> None:
@@ -612,7 +651,33 @@ def get_open_orders(condition_id: str) -> list[dict]:
     client = get_client()
     from py_clob_client.clob_types import OpenOrderParams
     orders = client.get_orders(OpenOrderParams(market=condition_id))
-    return orders if isinstance(orders, list) else []
+    if isinstance(orders, list):
+        return orders
+    if isinstance(orders, dict):
+        return orders.get("data", orders.get("orders", []))
+    return []
+
+
+def get_all_open_orders() -> list[dict]:
+    """Return all open orders across all markets for this API key."""
+    client = get_client()
+    from py_clob_client.clob_types import OpenOrderParams
+    END_CURSOR = "LTE="
+    cursor = "MA=="
+    results = []
+    while True:
+        page = client.get_orders(OpenOrderParams(), next_cursor=cursor)
+        if isinstance(page, list):
+            results.extend(page)
+            break
+        if isinstance(page, dict):
+            results.extend(page.get("data", page.get("orders", [])))
+            cursor = page.get("next_cursor", END_CURSOR)
+            if cursor == END_CURSOR:
+                break
+        else:
+            break
+    return results
 
 
 def print_market_summary(market: LoLMarket, p_model: float | None = None) -> None:
@@ -806,4 +871,172 @@ def check_market_rewards(condition_id: str) -> None:
         print(f"     Remaining:       ${remaining:,.0f}")
     if competitive != "?":
         print(f"     Competitiveness: {competitive}")
+    print(f"{'─'*55}\n")
+
+
+def find_reward_markets(
+    max_capital_per_side: float = 1000.0,
+    min_daily_rate: float = 10.0,
+    categories: list[str] | None = None,
+) -> list[RewardMarket]:
+    """
+    Scan Polymarket for markets with active liquidity rewards that are
+    affordable within the given capital budget.
+
+    Returns a list of RewardMarket sorted by daily_rate descending
+    (best opportunities first).
+
+    Parameters
+    ----------
+    max_capital_per_side : max USDC per side (min_shares × price ≤ this)
+    min_daily_rate       : minimum $/day reward pool to include
+    categories           : list of tag slugs to filter by (e.g. ["esports", "politics"]).
+                           None or empty = fetch ALL categories (no tag filter).
+    """
+    client = get_client()
+    base_url = f"{client.host}/rewards/markets/multi"
+    base_params = {
+        "order_by": "rate_per_day",
+        "position": "DESC",
+        "page_size": 500,
+    }
+
+    # Build list of (slug, params) to fetch — one request per category, or one unfiltered
+    if not categories:
+        fetch_list = [(None, base_params)]
+    else:
+        fetch_list = [(slug, {**base_params, "tag_slug": slug}) for slug in categories]
+
+    seen: set[str] = set()
+    results: list[RewardMarket] = []
+
+    for cat_slug, params in fetch_list:
+        try:
+            resp = requests.get(base_url, params=params, timeout=15)
+            if not resp.ok:
+                continue
+            data = resp.json()
+        except Exception:
+            continue
+
+        items = data if isinstance(data, list) else data.get("data", [])
+
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+
+            cid         = item.get("condition_id") or item.get("conditionId", "")
+            if not cid or cid in seen:
+                continue
+
+            question    = item.get("question", "")
+            max_spread  = float(item.get("rewards_max_spread", 3))       # cents
+            min_shares  = int(item.get("rewards_min_size", 0))
+            competitive = float(item.get("market_competitiveness", 0) or 0)
+            daily_rate  = float(
+                item.get("native_daily_rate")
+                or item.get("total_daily_rate")
+                or 0
+            )
+
+            # Extract remaining pool from rewards_config
+            configs = item.get("rewards_config") or []
+            remaining = sum(
+                float(c.get("remaining_reward_amount", 0) or 0) for c in configs
+            )
+
+            # Get YES price from tokens list
+            tokens = item.get("tokens") or []
+            yes_price = 0.5  # fallback
+            for tok in tokens:
+                outcome = (tok.get("outcome") or "").lower()
+                if outcome in ("yes", "1", "true", "win") or (
+                    tokens.index(tok) == 0 and len(tokens) == 2
+                ):
+                    try:
+                        yes_price = float(tok.get("price", 0.5) or 0.5)
+                        break
+                    except (ValueError, TypeError):
+                        pass
+
+            capital_per_side = min_shares * yes_price
+
+            # Apply filters
+            if daily_rate < min_daily_rate:
+                continue
+            if min_shares > 0 and capital_per_side > max_capital_per_side:
+                continue
+
+            # Determine category: prefer explicit tag_slug on item, fall back to the
+            # slug we used when querying (cat_slug), or first tag in tags list.
+            item_cat = (
+                item.get("tag_slug")
+                or (item.get("tags") or [{}])[0].get("slug", "")
+                or cat_slug
+                or ""
+            )
+
+            seen.add(cid)
+            results.append(RewardMarket(
+                condition_id=cid,
+                question=question,
+                daily_rate=daily_rate,
+                max_spread_c=max_spread,
+                min_shares=min_shares,
+                competitiveness=competitive,
+                yes_price=yes_price,
+                capital_per_side=capital_per_side,
+                remaining_pool=remaining,
+                category=str(item_cat),
+            ))
+
+    results.sort(key=lambda m: m.daily_rate, reverse=True)
+    return results
+
+
+
+def print_reward_markets(markets: list[RewardMarket]) -> None:
+    """Print a formatted table of reward market opportunities."""
+    if not markets:
+        print("No reward markets found matching your criteria.")
+        return
+
+    print(f"\n{'─'*108}")
+    print(f"  {'MARKET':<42} {'CATEGORY':<12} {'$/DAY':>7}  {'SPR':>4}  {'MIN SH':>7}  {'CAP/SIDE':>9}  {'COMP':>5}  {'REMAIN':>8}")
+    print(f"{'─'*108}")
+    for m in markets:
+        comp_str = f"{m.competitiveness:.1f}"
+        q = m.question[:41]
+        cat = (m.category or "—")[:11]
+        print(
+            f"  {q:<42} {cat:<12} ${m.daily_rate:>6.0f}  ±{m.max_spread_c:.0f}¢  "
+            f"{m.min_shares:>7}  ${m.capital_per_side:>8.0f}  {comp_str:>5}  ${m.remaining_pool:>7.0f}"
+        )
+    print(f"{'─'*108}")
+    print(f"  {len(markets)} markets  ·  Sorted by daily rate\n")
+
+
+def merge_positions(condition_id: str, amount: float) -> None:
+    """
+    Merge YES + NO tokens back into USDC.e after both sides fill.
+
+    This requires an on-chain transaction via the Polymarket CTF contract:
+        Contract: 0x4D97DCd97eC945f40cF65F87097ACe5EA0476045
+        Function: mergePositions(collateral, parentCollectionId, conditionId, partition, amount)
+        Partition: [1, 2]  (YES=1, NO=2)
+
+    Currently requires web3.py or py_builder_relayer_client (neither installed).
+    To merge manually: go to polymarket.com → Portfolio → find the market → Merge.
+
+    This function is a placeholder — it will print instructions until web3 is available.
+    """
+    print(f"\n{'─'*55}")
+    print(f"  Merge positions — {amount:.0f} YES + {amount:.0f} NO → ${amount:.2f} USDC.e")
+    print(f"")
+    print(f"  ⚠ Automated merge requires web3.py (not installed).")
+    print(f"  Manual steps:")
+    print(f"    1. Go to polymarket.com/portfolio")
+    print(f"    2. Find this market: {condition_id[:20]}...")
+    print(f"    3. Click 'Merge' to convert {amount:.0f} token pairs → USDC.e")
+    print(f"    4. Capital is recycled and ready for the next market")
     print(f"{'─'*55}\n")
